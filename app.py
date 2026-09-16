@@ -90,11 +90,23 @@ def streamc_m3u8(embed_url: str) -> str:
     return "\n".join(out) + "\n"
 
 def api_movies(page=1, type_=None, q=None):
+    if q:
+        for key in ("q", "keyword", "search", "name"):
+            params = {"page": page, key: q}
+            if type_:
+                params["type"] = type_
+            try:
+                r = S().get(f"{API}/movies", params=params, impersonate=IMP, timeout=15)
+                if r.status_code == 200:
+                    data = (r.json() or {}).get("data") or []
+                    if data:
+                        return data
+            except Exception:
+                continue
+        return []
     params = {"page": page}
     if type_:
         params["type"] = type_
-    if q:
-        params["q"] = q
     r = S().get(f"{API}/movies", params=params, impersonate=IMP, timeout=15)
     if r.status_code != 200:
         return []
@@ -103,14 +115,16 @@ def api_movies(page=1, type_=None, q=None):
 def unescape_js(s: str) -> str:
     if not s:
         return ""
-    s = s.replace("\\/", "/")
+    s = s.replace("\\/", "/").replace("\/", "/")
+    s = re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), s)
+    s = re.sub(r"\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), s)
     try:
-        return bytes(s, "utf-8").decode("unicode_escape")
+        fixed = s.encode("latin-1").decode("utf-8")
+        if any(ord(c) > 127 for c in fixed):
+            return fixed
     except Exception:
-        try:
-            return s.encode("latin-1").decode("utf-8")
-        except Exception:
-            return s
+        pass
+    return s
 
 def parse_page_detail(slug: str):
     r = S().get(f"{SITE}/phim/{slug}", impersonate=IMP, timeout=20)
@@ -221,7 +235,7 @@ def tmdb_name(imdb_id):
 def manifest():
     return j({
         "id": "org.nuvio.onflix.vps",
-        "version": "1.0.1",
+        "version": "1.0.2",
         "name": "Onflix",
         "description": "Onflix nguồn chính (NC)",
         "logo": "https://www.google.com/s2/favicons?domain=https://onflix.lat&sz=256",
@@ -259,19 +273,33 @@ def meta(mtype, mid):
     slug = mid.split(":", 1)[1]
     # if id is numeric from bad parse
     meta_obj, episodes = parse_page_detail(slug)
-    if not meta_obj:
-        # try API search by slug-ish
-        items = api_movies(q=slug.replace("-", " "))
-        if items:
-            return j({"meta": item_meta(items[0])})
+    items = api_movies(q=slug.replace("-", " "))
+    api_it = None
+    for it in items:
+        if it.get("slug") == slug:
+            api_it = it
+            break
+    if not api_it and items:
+        api_it = items[0]
+    if not meta_obj and not api_it:
         return j({"meta": {}})
+    if api_it:
+        name = api_it.get("title") or (meta_obj or {}).get("name") or slug
+        poster = api_it.get("poster_url") or (meta_obj or {}).get("poster") or ""
+        year = str(api_it.get("year") or (meta_obj or {}).get("year") or "")
+        origin = api_it.get("original_title") or (meta_obj or {}).get("origin_name") or ""
+    else:
+        name = meta_obj.get("name") or slug
+        poster = meta_obj.get("poster") or ""
+        year = meta_obj.get("year") or ""
+        origin = meta_obj.get("origin_name") or ""
     out = {
         "id": f"onflix:{slug}",
         "type": mtype,
-        "name": meta_obj.get("name") or slug,
-        "poster": meta_obj.get("poster") or "",
-        "background": meta_obj.get("poster") or "",
-        "releaseInfo": meta_obj.get("year") or "",
+        "name": name,
+        "poster": poster,
+        "background": poster,
+        "releaseInfo": year,
         "description": "",
     }
     videos, seen = [], set()
