@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Onflix VPS addon — catalog / meta / stream
+"""Onflix VPS addon 1.1.1 — exact slug, filtered search, NC + m3u8."""
 from __future__ import annotations
 
 import base64
@@ -60,7 +60,6 @@ def public_root():
     return f"http://{host}"
 
 
-# ----- streamc decrypt -----
 def decrypt_bootstrap(envelope, api_url):
     if envelope.get("format") != "aesgcm-v1":
         return envelope
@@ -138,7 +137,6 @@ def streamc_m3u8(embed_url: str) -> str:
     return "\n".join(out) + "\n"
 
 
-# ----- Onflix API -----
 def api_movies(page=1, type_=None, q=None):
     params = {"page": page}
     if type_:
@@ -152,6 +150,45 @@ def api_movies(page=1, type_=None, q=None):
         return (r.json() or {}).get("data") or []
     except Exception:
         return []
+
+
+def filter_search(items, q: str):
+    """Drop API noise — keep only items whose title/original contains query tokens."""
+    if not q or not items:
+        return items or []
+    tokens = [t.lower() for t in re.split(r"\s+", q.strip()) if len(t) >= 2]
+    if not tokens:
+        return items
+    out = []
+    for it in items:
+        blob = " ".join(
+            [
+                str(it.get("title") or ""),
+                str(it.get("original_title") or ""),
+                str(it.get("slug") or ""),
+            ]
+        ).lower()
+        if all(tok in blob for tok in tokens) or any(
+            tok in blob for tok in tokens if len(tok) >= 3
+        ):
+            out.append(it)
+    return out
+
+
+def find_by_slug(slug: str):
+    """Exact slug only — never return a random first hit."""
+    # try q=slug and q=slug with spaces
+    for q in (slug, slug.replace("-", " ")):
+        for it in api_movies(q=q):
+            if it.get("slug") == slug:
+                return it
+    # scan first pages of lists
+    for type_ in (None, "phim-bo", "phim-le"):
+        for page in range(1, 4):
+            for it in api_movies(page=page, type_=type_):
+                if it.get("slug") == slug:
+                    return it
+    return None
 
 
 def item_meta(it):
@@ -175,7 +212,6 @@ def item_meta(it):
 
 
 def parse_episodes(slug: str):
-    """Parse episode list from film HTML. Prefer NC/streamc, else direct m3u8."""
     try:
         r = S().get(f"{SITE}/phim/{slug}", impersonate=IMP, timeout=20)
         if r.status_code != 200:
@@ -186,9 +222,8 @@ def parse_episodes(slug: str):
 
     episodes = []
 
-    # 1) streamc NC
     for m in re.finditer(
-        r"(embed\d*)\.streamc\.xyz(?:\\/|/)embed\.php\?hash=([a-f0-9]{16,})",
+        r"(embed\d*)\.streamc\.xyz(?:\\+/|/)embed\.php\?hash=([a-f0-9]{16,})",
         html,
     ):
         emb = f"https://{m.group(1)}.streamc.xyz/embed.php?hash={m.group(2)}"
@@ -201,13 +236,17 @@ def parse_episodes(slug: str):
             }
         )
 
-    # 2) direct m3u8 (kkphimplayer / opstream / etc.) — backup
+    # m3u8 direct — many escape styles
     for m in re.finditer(
-        r"link_m3u8\\\":\\\"(https:[^\"\\]+\\.m3u8[^\"\\]*)\\\"",
+        r"https:(?:\\+/)+[a-z0-9.-]+(?:\\+/)+[^\s\"'\\]+?\.m3u8[^\s\"'\\]*",
         html,
+        re.I,
     ):
-        url = m.group(1).replace("\\/", "/")
-        if "streamc" in url:
+        url = m.group(0).replace("\\/", "/").replace("\\/", "/")
+        url = url.replace("\\", "")
+        if "streamc" in url or "onflixstream" in url:
+            continue
+        if not url.startswith("http"):
             continue
         episodes.append(
             {
@@ -218,7 +257,6 @@ def parse_episodes(slug: str):
             }
         )
 
-    # dedupe
     seen, out = set(), []
     for ep in episodes:
         key = ep.get("link_embed") or ep.get("link_m3u8")
@@ -254,10 +292,9 @@ def pick_slug_from_search(keywords):
     for kw in keywords:
         if not kw:
             continue
-        items = api_movies(q=kw)
+        items = filter_search(api_movies(q=kw), kw)
         if not items:
             continue
-        # prefer exact-ish title match
         kw_l = kw.lower()
         for it in items:
             t = (it.get("title") or "").lower()
@@ -268,31 +305,26 @@ def pick_slug_from_search(keywords):
     return None, None
 
 
-def stream_title(server_name, it_or_meta, ep_name=None):
-    name = ""
-    origin = ""
-    year = ""
-    if isinstance(it_or_meta, dict):
-        name = it_or_meta.get("title") or it_or_meta.get("name") or ""
-        origin = (
-            it_or_meta.get("original_title")
-            or it_or_meta.get("origin_name")
-            or ""
-        )
-        year = str(it_or_meta.get("year") or "")[:4]
+def stream_title(server_name, info, ep_name=None):
+    name = (info or {}).get("title") or (info or {}).get("name") or ""
+    origin = (
+        (info or {}).get("original_title")
+        or (info or {}).get("origin_name")
+        or ""
+    )
+    year = str((info or {}).get("year") or "")[:4]
     nums = re.findall(r"\d+", str(ep_name or ""))
     ep_label = f"Tập {int(nums[0])}" if nums else ""
     parts = [x for x in [name, origin, year, "FHD", "Vietsub", ep_label] if x]
     return f"{server_name}\n" + " - ".join(parts)
 
 
-# ----- routes -----
 @app.get("/manifest.json")
 def manifest():
     return j(
         {
             "id": "org.nuvio.onflix.vps",
-            "version": "1.1.0",
+            "version": "1.1.1",
             "name": "Onflix",
             "description": "Onflix (NC + m3u8)",
             "logo": "https://www.google.com/s2/favicons?domain=https://onflix.lat&sz=256",
@@ -329,7 +361,8 @@ def manifest():
 def catalog(ctype, cid, skip=0, search=None):
     page = max(1, int(skip) // 20 + 1) if skip else 1
     if search:
-        items = api_movies(page=1, q=unquote(search))
+        q = unquote(search)
+        items = filter_search(api_movies(page=1, q=q), q)
     elif "series" in cid or ctype == "series":
         items = api_movies(page=page, type_="phim-bo")
     else:
@@ -343,21 +376,14 @@ def meta(mtype, mid):
     if not mid.startswith("onflix:"):
         return j({"meta": {}})
     slug = mid.split(":", 1)[1]
-    items = api_movies(q=slug.replace("-", " "))
-    it = None
-    for x in items:
-        if x.get("slug") == slug:
-            it = x
-            break
-    if not it and items:
-        it = items[0]
+    it = find_by_slug(slug)
     if not it:
         return j(
             {
                 "meta": {
                     "id": f"onflix:{slug}",
                     "type": mtype,
-                    "name": slug,
+                    "name": slug.replace("-", " ").title(),
                 }
             }
         )
@@ -400,13 +426,7 @@ def stream(stype, sid):
                 episode = int(parts[-1])
             except ValueError:
                 episode = None
-        items = api_movies(q=slug.replace("-", " "))
-        for x in items:
-            if x.get("slug") == slug:
-                info = x
-                break
-        if not info and items:
-            info = items[0]
+        info = find_by_slug(slug) or {"slug": slug, "title": slug.replace("-", " ")}
     else:
         imdb = sid
         if stype == "series" and sid.count(":") >= 2:
@@ -421,14 +441,14 @@ def stream(stype, sid):
         for k in (original, title):
             if k and k not in keywords:
                 keywords.append(k)
-        # also try first significant words
         for k in list(keywords):
-            parts = re.split(r"[:\-–]", k)
-            if parts and parts[0].strip() and parts[0].strip() not in keywords:
-                keywords.append(parts[0].strip())
+            head = re.split(r"[:\-–]", k)[0].strip()
+            if head and head not in keywords:
+                keywords.append(head)
         slug, info = pick_slug_from_search(keywords)
         if not slug:
             return j({"streams": []})
+        info = info or find_by_slug(slug) or {}
 
     eps = parse_episodes(slug)
     if not eps:
@@ -437,14 +457,12 @@ def stream(stype, sid):
     streams = []
     root = public_root()
     for ep in eps:
-        if episode is not None:
+        if episode is not None and len(eps) > 1:
             nums = re.findall(r"\d+", str(ep.get("name") or ""))
             if nums and int(nums[0]) != int(episode):
-                # single-ep movies often name "1" only — still allow if only one ep
-                if len(eps) > 1:
-                    continue
+                continue
         title = stream_title(
-            ep.get("server_name") or "Onflix", info or {}, ep.get("name")
+            ep.get("server_name") or "Onflix", info, ep.get("name")
         )
         try:
             if ep.get("kind") == "streamc" and ep.get("link_embed"):
@@ -454,7 +472,7 @@ def stream(stype, sid):
                     .decode()
                     .rstrip("=")
                 )
-                CACHE[token] = (m3u8, time.time() + 600, ep["link_embed"])
+                CACHE[token] = (m3u8, time.time() + 600)
                 host = urlparse(ep["link_embed"]).hostname or "embed11.streamc.xyz"
                 streams.append(
                     {
@@ -517,7 +535,7 @@ def play(token):
     else:
         try:
             m3u8 = streamc_m3u8(embed)
-            CACHE[token] = (m3u8, time.time() + 600, embed)
+            CACHE[token] = (m3u8, time.time() + 600)
         except Exception as e:
             return Response(str(e), 502)
     return Response(
@@ -532,4 +550,4 @@ def play(token):
 
 @app.get("/")
 def root():
-    return j({"ok": True, "version": "1.1.0", "manifest": "/manifest.json"})
+    return j({"ok": True, "version": "1.1.1", "manifest": "/manifest.json"})
