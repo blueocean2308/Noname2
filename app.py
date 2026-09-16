@@ -153,26 +153,31 @@ def api_movies(page=1, type_=None, q=None):
 
 
 def filter_search(items, q: str):
-    """Drop API noise — keep only items whose title/original contains query tokens."""
+    """Keep items that match any meaningful token; if none match, return []."""
     if not q or not items:
         return items or []
-    tokens = [t.lower() for t in re.split(r"\s+", q.strip()) if len(t) >= 2]
-    if not tokens:
-        return items
+    q = q.strip().lower()
+    tokens = [t for t in re.split(r"[\s/:\-]+", q) if len(t) >= 2]
+    # also full query without spaces
+    compact = re.sub(r"\s+", "", q)
     out = []
     for it in items:
-        blob = " ".join(
-            [
-                str(it.get("title") or ""),
-                str(it.get("original_title") or ""),
-                str(it.get("slug") or ""),
-            ]
-        ).lower()
-        if all(tok in blob for tok in tokens) or any(
-            tok in blob for tok in tokens if len(tok) >= 3
-        ):
-            out.append(it)
-    return out
+        title = str(it.get("title") or "").lower()
+        origin = str(it.get("original_title") or "").lower()
+        slug = str(it.get("slug") or "").lower()
+        blob = f"{title} {origin} {slug} {title.replace(' ', '')} {origin.replace(' ', '')}"
+        score = 0
+        if q in title or q in origin or q in slug:
+            score += 10
+        if compact and compact in blob.replace(" ", ""):
+            score += 5
+        for tok in tokens:
+            if tok in blob:
+                score += 2
+        if score > 0:
+            out.append((score, it))
+    out.sort(key=lambda x: -x[0])
+    return [it for _, it in out]
 
 
 def find_by_slug(slug: str):
@@ -324,7 +329,7 @@ def manifest():
     return j(
         {
             "id": "org.nuvio.onflix.vps",
-            "version": "1.1.1",
+            "version": "1.1.2",
             "name": "Onflix",
             "description": "Onflix (NC + m3u8)",
             "logo": "https://www.google.com/s2/favicons?domain=https://onflix.lat&sz=256",
@@ -336,13 +341,19 @@ def manifest():
                     "id": "onflix_movie",
                     "type": "movie",
                     "name": "Onflix Phim lẻ",
-                    "extra": [{"name": "skip", "isRequired": False}],
+                    "extra": [
+                        {"name": "skip", "isRequired": False},
+                        {"name": "search", "isRequired": False},
+                    ],
                 },
                 {
                     "id": "onflix_series",
                     "type": "series",
                     "name": "Onflix Phim bộ",
-                    "extra": [{"name": "skip", "isRequired": False}],
+                    "extra": [
+                        {"name": "skip", "isRequired": False},
+                        {"name": "search", "isRequired": False},
+                    ],
                 },
                 {
                     "id": "onflix_search",
