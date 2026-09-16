@@ -235,7 +235,7 @@ def tmdb_name(imdb_id):
 def manifest():
     return j({
         "id": "org.nuvio.onflix.vps",
-        "version": "1.0.2",
+        "version": "1.0.3",
         "name": "Onflix",
         "description": "Onflix nguồn chính (NC)",
         "logo": "https://www.google.com/s2/favicons?domain=https://onflix.lat&sz=256",
@@ -271,47 +271,55 @@ def meta(mtype, mid):
     if not mid.startswith("onflix:"):
         return j({"meta": {}})
     slug = mid.split(":", 1)[1]
-    # if id is numeric from bad parse
-    meta_obj, episodes = parse_page_detail(slug)
-    items = api_movies(q=slug.replace("-", " "))
+    try:
+        meta_obj, episodes = parse_page_detail(slug)
+    except Exception:
+        meta_obj, episodes = None, []
     api_it = None
-    for it in items:
-        if it.get("slug") == slug:
-            api_it = it
-            break
-    if not api_it and items:
-        api_it = items[0]
-    if not meta_obj and not api_it:
-        return j({"meta": {}})
+    try:
+        for it in api_movies(q=slug.replace("-", " ")) or []:
+            if it.get("slug") == slug:
+                api_it = it
+                break
+        if not api_it:
+            items = api_movies(q=slug.replace("-", " ")) or []
+            api_it = items[0] if items else None
+    except Exception:
+        api_it = None
     if api_it:
         name = api_it.get("title") or (meta_obj or {}).get("name") or slug
         poster = api_it.get("poster_url") or (meta_obj or {}).get("poster") or ""
         year = str(api_it.get("year") or (meta_obj or {}).get("year") or "")
-        origin = api_it.get("original_title") or (meta_obj or {}).get("origin_name") or ""
-    else:
+        stype = "series" if api_it.get("type") == "phim-bo" else mtype
+    elif meta_obj:
         name = meta_obj.get("name") or slug
         poster = meta_obj.get("poster") or ""
-        year = meta_obj.get("year") or ""
-        origin = meta_obj.get("origin_name") or ""
+        year = str(meta_obj.get("year") or "")
+        stype = mtype
+    else:
+        return j({"meta": {"id": f"onflix:{slug}", "type": mtype, "name": slug}})
     out = {
         "id": f"onflix:{slug}",
-        "type": mtype,
+        "type": stype,
         "name": name,
         "poster": poster,
         "background": poster,
         "releaseInfo": year,
-        "description": "",
+        "description": (api_it or {}).get("categories") or "",
     }
     videos, seen = [], set()
-    for ep in episodes:
-        if not is_primary_nc(ep):
+    for ep in episodes or []:
+        try:
+            if not is_primary_nc(ep):
+                continue
+            nums = re.findall(r"\d+", str(ep.get("name") or ""))
+            epn = int(nums[0]) if nums else len(videos) + 1
+            if epn in seen:
+                continue
+            seen.add(epn)
+            videos.append({"id": f"onflix:{slug}:{epn}", "title": f"Tập {epn}", "season": 1, "episode": epn})
+        except Exception:
             continue
-        nums = re.findall(r"\d+", str(ep.get("name") or ""))
-        epn = int(nums[0]) if nums else len(videos) + 1
-        if epn in seen:
-            continue
-        seen.add(epn)
-        videos.append({"id": f"onflix:{slug}:{epn}", "title": f"Tập {epn}", "season": 1, "episode": epn})
     if len(videos) > 1:
         out["type"] = "series"
         out["videos"] = videos
