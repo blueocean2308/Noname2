@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Onflix addon — only primary NC (streamc), no KKPHIM side sources."""
+"""Onflix — primary NC (streamc) only."""
 from __future__ import annotations
 import base64, hashlib, hmac, json, re, time
 from urllib.parse import urljoin, urlparse, unquote
@@ -22,8 +22,12 @@ def S():
     return s
 
 def j(data, code=200):
-    return Response(json.dumps(data, ensure_ascii=False), status=code, mimetype="application/json",
-                    headers={"Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "*"})
+    return Response(
+        json.dumps(data, ensure_ascii=False),
+        status=code,
+        mimetype="application/json; charset=utf-8",
+        headers={"Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "*"},
+    )
 
 def public_root():
     host = request.headers.get("Host") or PUBLIC_HOST
@@ -94,91 +98,87 @@ def api_movies(page=1, type_=None, q=None):
     r = S().get(f"{API}/movies", params=params, impersonate=IMP, timeout=15)
     if r.status_code != 200:
         return []
-    data = r.json()
-    return data.get("data") or []
+    return (r.json() or {}).get("data") or []
+
+def unescape_js(s: str) -> str:
+    if not s:
+        return ""
+    s = s.replace("\\/", "/")
+    try:
+        return bytes(s, "utf-8").decode("unicode_escape")
+    except Exception:
+        try:
+            return s.encode("latin-1").decode("utf-8")
+        except Exception:
+            return s
 
 def parse_page_detail(slug: str):
-    """HTML có JSON escaped: episodes với link_embed streamc, src=nc."""
     r = S().get(f"{SITE}/phim/{slug}", impersonate=IMP, timeout=20)
     if r.status_code != 200:
         return None, []
     html = r.text
-    # unescape common \\ sequences for search
-    # extract episodes array roughly
-    m = re.search(r'episodes\\":(\[.*?\])\\",\\"related\\"', html, re.S)
-    if not m:
-        m = re.search(r'episodes\\":(\[.*?\])\\s*,\\s*\\"related\\"', html, re.S)
-    raw = None
-    if m:
-        raw = m.group(1).encode().decode("unicode_escape")
-    else:
-        # fallback: find each link_embed near (NC)
-        pass
     episodes = []
-    if raw:
-        try:
-            episodes = json.loads(raw)
-        except Exception:
-            episodes = []
-    if not episodes:
-        # regex fallback
-        for em in re.finditer(
-            r'link_embed\\":\\"(https:[^"\\]+)\\".*?link_m3u8\\":\\"(https:[^"\\]+)\\".*?name\\":\\"([^"\\]*)\\".*?server_name\\":\\"([^"\\]*)\\".*?src\\":\\"([^"\\]*)\\"',
-            html, re.S,
-        ):
+    # pattern in page: link_embed\":\"https://embed...hash=...\"
+    blocks = re.findall(
+        r'link_embed\\":\\"(https:[^"\\]+)\\".{0,200}?link_m3u8\\":\\"(https:[^"\\]*)\\".{0,120}?\\"name\\":\\"([^"\\]*)\\".{0,80}?server_name\\":\\"([^"\\]*)\\".{0,80}?src\\":\\"([^"\\]*)\\"',
+        html,
+        re.S,
+    )
+    if not blocks:
+        blocks = re.findall(
+            r'link_embed\\":\\"(https:[^"\\]+hash=[a-f0-9]+)\\".{0,300}?server_name\\":\\"([^"\\]*)\\".{0,80}?src\\":\\"([^"\\]*)\\"',
+            html,
+            re.S,
+        )
+        for b in blocks:
             episodes.append({
-                "link_embed": em.group(1).encode().decode("unicode_escape") if "\\" in em.group(1) else em.group(1),
-                "link_m3u8": em.group(2),
-                "name": em.group(3),
-                "server_name": em.group(4),
-                "src": em.group(5),
+                "link_embed": b[0].replace("\\/", "/"),
+                "link_m3u8": "",
+                "name": "1",
+                "server_name": unescape_js(b[1]),
+                "src": b[2],
             })
-        # simpler
-        if not episodes:
-            embeds = re.findall(r'link_embed\\":\\"(https:\\+/\\+/embed[^"\\]+hash=[a-f0-9]+)\\"', html)
-            names = re.findall(r'server_name\\":\\"([^"\\]+)\\"', html)
-            srcs = re.findall(r'src\\":\\"([^"\\]+)\\"', html)
-            epnames = re.findall(r'\\"name\\":\\"(\d+)\\"', html)
-            for i, emb in enumerate(embeds):
-                emb = emb.replace("\\/", "/")
-                episodes.append({
-                    "link_embed": emb,
-                    "name": epnames[i] if i < len(epnames) else str(i + 1),
-                    "server_name": names[i] if i < len(names) else "Vietsub",
-                    "src": srcs[i] if i < len(srcs) else "nc",
-                })
-    # meta from list fields in page
-    title_m = re.search(r'\\"title\\":\\"([^"\\]+)\\"', html)
-    origin_m = re.search(r'\\"original_title\\":\\"([^"\\]+)\\"', html)
-    year_m = re.search(r'\\"year\\":(\d+)', html)
-    poster_m = re.search(r'\\"poster_url\\":\\"(https:[^"\\]+)\\"', html)
+    else:
+        for b in blocks:
+            episodes.append({
+                "link_embed": b[0].replace("\\/", "/"),
+                "link_m3u8": b[1].replace("\\/", "/"),
+                "name": b[2],
+                "server_name": unescape_js(b[3]),
+                "src": b[4],
+            })
+
+    def grab(pat):
+        m = re.search(pat, html)
+        return unescape_js(m.group(1)) if m else ""
+
     meta = {
-        "name": (title_m.group(1) if title_m else slug).encode().decode("unicode_escape") if title_m else slug,
-        "origin_name": origin_m.group(1).encode().decode("unicode_escape") if origin_m else "",
-        "year": year_m.group(1) if year_m else "",
-        "poster": poster_m.group(1).replace("\\/", "/") if poster_m else "",
+        "name": grab(r'\\"title\\":\\"([^"\\]+)\\"') or slug,
+        "origin_name": grab(r'\\"original_title\\":\\"([^"\\]+)\\"'),
+        "year": (re.search(r'\\"year\\":(\d+)', html) or type("", (), {"group": lambda *a: ""})()).group(1) if re.search(r'\\"year\\":(\d+)', html) else "",
+        "poster": grab(r'\\"poster_url\\":\\"(https:[^"\\]+)\\"'),
         "slug": slug,
     }
+    ym = re.search(r'\\"year\\":(\d+)', html)
+    meta["year"] = ym.group(1) if ym else ""
     return meta, episodes
 
 def is_primary_nc(ep: dict) -> bool:
     src = (ep.get("src") or "").lower()
     sname = (ep.get("server_name") or "").lower()
-    if src in ("kk", "kkphim", "ophim", "backup"):
+    if src in ("kk", "kkphim", "ophim", "backup") or "kkphim" in sname or "ophim" in sname:
         return False
-    if "kkphim" in sname or "ophim" in sname:
-        return False
-    if src == "nc" or "(nc)" in sname or "nguonc" in sname:
-        return True
-    # default: allow streamc embeds only
     emb = ep.get("link_embed") or ""
-    return "streamc.xyz" in emb or "embed.php?hash=" in emb
+    if src == "nc" or "(nc)" in sname:
+        return True
+    return "streamc.xyz" in emb and "hash=" in emb
 
-def item_meta(it, stype="movie"):
+def item_meta(it):
     slug = str(it.get("slug") or it.get("id") or "")
+    stype = "series" if it.get("type") == "phim-bo" else "movie"
     return {
         "id": f"onflix:{slug}",
-        "type": stype if it.get("type") != "phim-bo" else "series",
+        "type": stype,
         "name": it.get("title") or it.get("name") or slug,
         "poster": it.get("poster_url") or it.get("thumb_url") or "",
         "posterShape": "poster",
@@ -190,7 +190,6 @@ def item_meta(it, stype="movie"):
 
 def stream_title(ep, meta, episode=None):
     sname = ep.get("server_name") or "Vietsub"
-    # bỏ (NC) cho gọn hoặc giữ
     name = meta.get("name") or ""
     origin = meta.get("origin_name") or meta.get("original_title") or ""
     year = str(meta.get("year") or "")[:4]
@@ -204,8 +203,11 @@ def stream_title(ep, meta, episode=None):
 
 def tmdb_name(imdb_id):
     try:
-        r = S().get(f"https://api.themoviedb.org/3/find/{imdb_id}",
-                    params={"api_key": TMDB_KEY, "external_source": "imdb_id"}, impersonate=IMP, timeout=10)
+        r = S().get(
+            f"https://api.themoviedb.org/3/find/{imdb_id}",
+            params={"api_key": TMDB_KEY, "external_source": "imdb_id"},
+            impersonate=IMP, timeout=10,
+        )
         d = r.json()
         for k in ("movie_results", "tv_results"):
             if d.get(k):
@@ -219,7 +221,7 @@ def tmdb_name(imdb_id):
 def manifest():
     return j({
         "id": "org.nuvio.onflix.vps",
-        "version": "1.0.0",
+        "version": "1.0.1",
         "name": "Onflix",
         "description": "Onflix nguồn chính (NC)",
         "logo": "https://www.google.com/s2/favicons?domain=https://onflix.lat&sz=256",
@@ -236,49 +238,43 @@ def manifest():
         ],
     })
 
-@app.get("/catalog/<ctype>/<cid>.json")
-def catalog_basic(ctype, cid):
-    return catalog_handler(ctype, cid, None, 1)
-
-@app.get("/catalog/<ctype>/<cid>/search=<path:search>.json")
-def catalog_search(ctype, cid, search):
-    return catalog_handler(ctype, cid, unquote(search), 1)
-
-@app.get("/catalog/<ctype>/<cid>/skip=<int:skip>.json")
-def catalog_skip(ctype, cid, skip):
-    return catalog_handler(ctype, cid, None, max(1, skip // 20 + 1))
-
-def catalog_handler(ctype, cid, search, page):
+@app.route("/catalog/<ctype>/<cid>.json")
+@app.route("/catalog/<ctype>/<cid>/skip=<int:skip>.json")
+@app.route("/catalog/<ctype>/<cid>/search=<path:search>.json")
+def catalog(ctype, cid, skip=0, search=None):
+    page = max(1, int(skip) // 20 + 1) if skip else 1
     if search:
-        items = api_movies(page=1, q=search)
+        items = api_movies(page=1, q=unquote(search))
     elif "series" in cid or ctype == "series":
         items = api_movies(page=page, type_="phim-bo")
     else:
         items = api_movies(page=page, type_="phim-le")
-    metas = [item_meta(it) for it in items[:30]]
-    return j({"metas": metas})
+    return j({"metas": [item_meta(it) for it in items[:30]]})
 
-@app.get("/meta/<mtype>/<path:mid>")
+@app.route("/meta/<mtype>/<path:mid>")
 def meta(mtype, mid):
     mid = mid.replace(".json", "")
     if not mid.startswith("onflix:"):
         return j({"meta": {}})
     slug = mid.split(":", 1)[1]
+    # if id is numeric from bad parse
     meta_obj, episodes = parse_page_detail(slug)
     if not meta_obj:
+        # try API search by slug-ish
+        items = api_movies(q=slug.replace("-", " "))
+        if items:
+            return j({"meta": item_meta(items[0])})
         return j({"meta": {}})
     out = {
         "id": f"onflix:{slug}",
         "type": mtype,
-        "name": meta_obj.get("name"),
-        "poster": meta_obj.get("poster"),
-        "background": meta_obj.get("poster"),
-        "releaseInfo": meta_obj.get("year"),
+        "name": meta_obj.get("name") or slug,
+        "poster": meta_obj.get("poster") or "",
+        "background": meta_obj.get("poster") or "",
+        "releaseInfo": meta_obj.get("year") or "",
         "description": "",
     }
-    # series videos from primary only names
-    videos = []
-    seen = set()
+    videos, seen = [], set()
     for ep in episodes:
         if not is_primary_nc(ep):
             continue
@@ -293,7 +289,7 @@ def meta(mtype, mid):
         out["videos"] = videos
     return j({"meta": out})
 
-@app.get("/stream/<stype>/<path:sid>")
+@app.route("/stream/<stype>/<path:sid>")
 def stream(stype, sid):
     sid = sid.replace(".json", "")
     season = episode = None
@@ -321,16 +317,17 @@ def stream(stype, sid):
             return j({"streams": []})
         slug = items[0].get("slug")
         meta_obj = {
-            "name": items[0].get("title"),
-            "origin_name": items[0].get("original_title"),
-            "year": items[0].get("year"),
+            "name": items[0].get("title") or "",
+            "origin_name": items[0].get("original_title") or "",
+            "year": items[0].get("year") or "",
         }
 
     if not slug:
         return j({"streams": []})
+
     page_meta, episodes = parse_page_detail(slug)
     if page_meta:
-        meta_obj = {**meta_obj, **page_meta}
+        meta_obj = {**meta_obj, **{k: v for k, v in page_meta.items() if v}}
 
     streams = []
     root = public_root()
@@ -341,14 +338,15 @@ def stream(stype, sid):
             nums = re.findall(r"\d+", str(ep.get("name") or ""))
             if nums and int(nums[0]) != int(episode):
                 continue
-        embed = ep.get("link_embed") or ""
-        if not embed or "hash=" not in embed:
+        embed = (ep.get("link_embed") or "").replace("\\/", "/")
+        if "hash=" not in embed:
             continue
         title = stream_title(ep, meta_obj, episode)
         try:
             m3u8 = streamc_m3u8(embed)
             token = base64.urlsafe_b64encode(embed.encode()).decode().rstrip("=")
             CACHE[token] = (m3u8, time.time() + 600)
+            host = urlparse(embed).hostname or "embed13.streamc.xyz"
             streams.append({
                 "name": "Onflix",
                 "title": title,
@@ -358,8 +356,8 @@ def stream(stype, sid):
                     "bingeGroup": f"onflix-{slug}",
                     "proxyHeaders": {
                         "request": {
-                            "Referer": "https://embed13.streamc.xyz/",
-                            "Origin": "https://embed13.streamc.xyz",
+                            "Referer": f"https://{host}/",
+                            "Origin": f"https://{host}",
                             "User-Agent": UA,
                         }
                     },
@@ -368,7 +366,7 @@ def stream(stype, sid):
         except Exception as e:
             streams.append({
                 "name": "Onflix",
-                "title": f"{title}\n{type(e).__name__}",
+                "title": f"{title}\n{type(e).__name__}: {e}",
                 "url": embed,
                 "behaviorHints": {"notWebReady": True},
             })
@@ -395,4 +393,4 @@ def play(token):
 
 @app.get("/")
 def root():
-    return j({"ok": True, "name": "Onflix", "manifest": "/manifest.json"})
+    return j({"ok": True, "version": "1.0.1", "manifest": "/manifest.json"})
