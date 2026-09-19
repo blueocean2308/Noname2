@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Onflix VPS 1.2.0 — api/search + full episode parse (NC)."""
+"""Onflix VPS 1.3.0 — api/search + NC streamc.
+Match Cinemeta/TMDB: ưu tiên title EN, bỏ keyword CJK làm chính, không items[0].
+CACHE in-memory TTL 10 phút + prune (không ghi đĩa).
+"""
 from __future__ import annotations
 
 import base64
@@ -8,6 +11,7 @@ import hmac
 import json
 import re
 import time
+import unicodedata
 from urllib.parse import urljoin, urlparse, unquote
 
 from flask import Flask, Response, request
@@ -26,6 +30,11 @@ SITE = "https://onflix.lat"
 PUBLIC_HOST = "168.138.176.147:51823"
 TMDB_KEY = "1adf1a2b5aece0ac5106302d3299f56f"
 CACHE: dict = {}
+CACHE_TTL = 600
+ADDON_VERSION = "1.3.0"
+
+# CJK / Hangul / Hiragana / Katakana
+_RE_CJK = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]")
 
 
 def S():
@@ -58,6 +67,29 @@ def public_root():
     if host.startswith("127.") or "localhost" in host:
         host = PUBLIC_HOST
     return f"http://{host}"
+
+
+def cache_put(token: str, m3u8: str):
+    """Lưu playlist decrypt trong RAM; dọn entry hết hạn."""
+    now = time.time()
+    expired = [k for k, v in CACHE.items() if v[1] <= now]
+    for k in expired:
+        CACHE.pop(k, None)
+    # giới hạn số entry (tránh phình RAM nếu xem nhiều)
+    if len(CACHE) > 200:
+        for k, _ in sorted(CACHE.items(), key=lambda x: x[1][1])[:50]:
+            CACHE.pop(k, None)
+    CACHE[token] = (m3u8, now + CACHE_TTL)
+
+
+def cache_get(token: str):
+    item = CACHE.get(token)
+    if not item:
+        return None
+    if item[1] <= time.time():
+        CACHE.pop(token, None)
+        return None
+    return item[0]
 
 
 def decrypt_bootstrap(envelope, api_url):
@@ -213,7 +245,6 @@ def parse_episodes(slug: str):
         return []
 
     episodes = []
-    # object chunks with link_embed streamc + name + server_name
     for m in re.finditer(
         r"link_embed\\\":\\\"(https:[^\"\\]*streamc\.xyz[^\"\\]*hash=[a-f0-9]+)\\\".{0,400}?"
         r"\\\"name\\\":\\\"([^\"\\]*)\\\".{0,120}?"
@@ -248,7 +279,6 @@ def parse_episodes(slug: str):
                 }
             )
 
-    # fallback direct m3u8 (not streamc playlist wrapper)
     if not episodes:
         for m in re.finditer(
             r"https:(?:\\+/)+[a-z0-9.-]+(?:\\+/)+[^\s\"'\\]+?\.m3u8",
@@ -267,7 +297,6 @@ def parse_episodes(slug: str):
                 }
             )
 
-    # fix server_name unicode
     for ep in episodes:
         sn = ep.get("server_name") or ""
         try:
@@ -275,7 +304,6 @@ def parse_episodes(slug: str):
                 ep["server_name"] = sn.encode("utf-8").decode("unicode_escape")
         except Exception:
             pass
-        # latin1 mojibake
         try:
             fixed = sn.encode("latin-1").decode("utf-8")
             if fixed != sn:
@@ -293,11 +321,65 @@ def parse_episodes(slug: str):
     return out
 
 
-def tmdb_names(imdb_id: str):
+def normalize_name(s: str) -> str:
+    s = (s or "").lower()
+    s = unicodedata.normalize("NFD", s)
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def is_mostly_cjk(s: str) -> bool:
+    if not s:
+        return False
+    cjk = len(_RE_CJK.findall(s))
+    return cjk >= max(1, len(s) // 3)
+
+
+def score_match(item: dict, title: str, original_title: str, year: str | None) -> int:
+    n_title = normalize_name(title)
+    n_orig = normalize_name(original_title)
+    n_name = normalize_name(item.get("title") or item.get("name") or "")
+    n_origin = normalize_name(item.get("original_title") or item.get("origin_name") or "")
+    score = 0
+
+    if n_origin and n_orig and n_origin == n_orig:
+        score += 120
+    if n_origin and n_title and n_origin == n_title:
+        score += 120
+    if n_name and n_title and n_name == n_title:
+        score += 100
+    if n_name and n_orig and n_name == n_orig:
+        score += 100
+
+    def long_enough(a, b):
+        return bool(a and b and min(len(a), len(b)) >= 6)
+
+    if long_enough(n_origin, n_orig) and (n_origin in n_orig or n_orig in n_origin):
+        score += 50
+    if long_enough(n_origin, n_title) and (n_origin in n_title or n_title in n_origin):
+        score += 45
+    if long_enough(n_name, n_title) and (n_name in n_title or n_title in n_name):
+        score += 40
+    if long_enough(n_name, n_orig) and (n_name in n_orig or n_orig in n_name):
+        score += 35
+
+    y = str(item.get("year") or "")[:4]
+    if year and y and y == str(year)[:4]:
+        score += 25
+    return score
+
+
+def tmdb_info(imdb_id: str):
+    """TMDB en-US — title tiếng Anh ưu tiên cho Cinemeta."""
     try:
         r = S().get(
             f"https://api.themoviedb.org/3/find/{imdb_id}",
-            params={"api_key": TMDB_KEY, "external_source": "imdb_id"},
+            params={
+                "api_key": TMDB_KEY,
+                "external_source": "imdb_id",
+                "language": "en-US",
+            },
             impersonate=IMP,
             timeout=10,
         )
@@ -305,29 +387,46 @@ def tmdb_names(imdb_id: str):
         for k in ("movie_results", "tv_results"):
             if d.get(k):
                 x = d[k][0]
-                return (
-                    x.get("title") or x.get("name"),
-                    x.get("original_title") or x.get("original_name"),
-                )
+                title = x.get("title") or x.get("name") or ""
+                original = x.get("original_title") or x.get("original_name") or title
+                year = (x.get("release_date") or x.get("first_air_date") or "")[:4]
+                return title, original, year
     except Exception:
         pass
-    return None, None
+    return None, None, None
 
 
-def pick_from_search(keywords):
+def pick_from_search(title: str, original_title: str, year: str | None):
+    """
+    Keyword: title EN trước.
+    original chỉ dùng nếu không phải CJK (tránh 스캔들 → phim adult).
+    Không fallback items[0]. Ngưỡng >= 100.
+    """
+    keywords = []
+    for k in (title, original_title):
+        k = (k or "").strip()
+        if not k:
+            continue
+        if is_mostly_cjk(k):
+            continue
+        if k not in keywords:
+            keywords.append(k)
+    # nếu cả hai đều CJK — thử original thô 1 lần (không lấy items[0])
+    if not keywords and original_title:
+        keywords.append(original_title.strip())
+
+    best, best_score = None, 0
     for kw in keywords:
-        if not kw:
-            continue
         items = api_search(kw)
-        if not items:
-            continue
-        kw_l = kw.lower()
         for it in items:
-            t = (it.get("title") or "").lower()
-            o = (it.get("original_title") or "").lower()
-            if kw_l in t or kw_l in o or t in kw_l or o in kw_l:
-                return it.get("slug"), it
-        return items[0].get("slug"), items[0]
+            sc = score_match(it, title or "", original_title or "", year)
+            if sc > best_score:
+                best_score, best = sc, it
+        if best_score >= 120:
+            break
+
+    if best and best_score >= 100:
+        return best.get("slug"), best
     return None, None
 
 
@@ -346,7 +445,7 @@ def manifest():
     return j(
         {
             "id": "org.nuvio.onflix.vps",
-            "version": "1.2.0",
+            "version": ADDON_VERSION,
             "name": "Onflix",
             "description": "Onflix NC (api/search)",
             "logo": "https://www.google.com/s2/favicons?domain=https://onflix.lat&sz=256",
@@ -466,12 +565,10 @@ def stream(stype, sid):
                 episode = int(p[2])
             except Exception:
                 pass
-        title, original = tmdb_names(imdb)
-        keywords = []
-        for k in (original, title):
-            if k and k not in keywords:
-                keywords.append(k)
-        slug, info = pick_from_search(keywords)
+        title, original, year = tmdb_info(imdb)
+        if not title and not original:
+            return j({"streams": []})
+        slug, info = pick_from_search(title or "", original or title or "", year)
         if not slug:
             return j({"streams": []})
         info = info or {}
@@ -480,7 +577,6 @@ def stream(stype, sid):
     if not eps:
         return j({"streams": []})
 
-    # unique servers for this episode
     streams = []
     root = public_root()
     seen_server = set()
@@ -490,7 +586,6 @@ def stream(stype, sid):
             if nums and int(nums[0]) != int(episode):
                 continue
         sname = ep.get("server_name") or "Onflix"
-        # one stream per server name for this episode
         key = sname
         if key in seen_server:
             continue
@@ -504,7 +599,7 @@ def stream(stype, sid):
                     .decode()
                     .rstrip("=")
                 )
-                CACHE[token] = (m3u8, time.time() + 600)
+                cache_put(token, m3u8)
                 host = (
                     urlparse(ep["link_embed"]).hostname or "embed11.streamc.xyz"
                 )
@@ -563,13 +658,11 @@ def play(token):
         embed = base64.urlsafe_b64decode(token + pad).decode()
     except Exception:
         return Response("bad token", 400)
-    item = CACHE.get(token)
-    if item and item[1] > time.time():
-        m3u8 = item[0]
-    else:
+    m3u8 = cache_get(token)
+    if m3u8 is None:
         try:
             m3u8 = streamc_m3u8(embed)
-            CACHE[token] = (m3u8, time.time() + 600)
+            cache_put(token, m3u8)
         except Exception as e:
             return Response(str(e), 502)
     return Response(
@@ -584,4 +677,8 @@ def play(token):
 
 @app.get("/")
 def root():
-    return j({"ok": True, "version": "1.2.0", "manifest": "/manifest.json"})
+    return j({"ok": True, "version": ADDON_VERSION, "manifest": "/manifest.json"})
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=51823, threaded=True)
