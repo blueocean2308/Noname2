@@ -30,8 +30,12 @@ SITE = "https://onflix.lat"
 PUBLIC_HOST = "168.138.176.147:51823"
 TMDB_KEY = "1adf1a2b5aece0ac5106302d3299f56f"
 CACHE: dict = {}
+API_CACHE: dict = {}
 CACHE_TTL = 600
-ADDON_VERSION = "1.3.0"
+API_TTL = 300
+DETAIL_TTL = 600
+TMDB_TTL = 86400
+ADDON_VERSION = "1.3.1"
 
 # CJK / Hangul / Hiragana / Katakana
 _RE_CJK = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]")
@@ -91,6 +95,25 @@ def cache_get(token: str):
         return None
     return item[0]
 
+
+
+def api_cache_get(key):
+    item = API_CACHE.get(key)
+    if not item:
+        return None
+    if item[1] <= time.time():
+        API_CACHE.pop(key, None)
+        return None
+    return item[0]
+
+def api_cache_put(key, data, ttl):
+    now = time.time()
+    for k in [k for k, v in list(API_CACHE.items()) if v[1] <= now]:
+        API_CACHE.pop(k, None)
+    if len(API_CACHE) > 400:
+        for k, _ in sorted(API_CACHE.items(), key=lambda x: x[1][1])[:50]:
+            API_CACHE.pop(k, None)
+    API_CACHE[key] = (data, now + ttl)
 
 def decrypt_bootstrap(envelope, api_url):
     if envelope.get("format") != "aesgcm-v1":
@@ -186,6 +209,10 @@ def api_search(q: str):
     """CloudStream uses /api/search?q= — NOT /api/movies?q=."""
     if not q:
         return []
+    key = f"search:{q.strip().lower()}"
+    hit = api_cache_get(key)
+    if hit is not None:
+        return hit
     try:
         r = S().get(
             f"{API}/search",
@@ -196,7 +223,9 @@ def api_search(q: str):
         if r.status_code != 200:
             return []
         d = r.json() or {}
-        return d.get("movies") or d.get("data") or []
+        items = d.get("movies") or d.get("data") or []
+        api_cache_put(key, items, API_TTL)
+        return items
     except Exception:
         return []
 
@@ -236,6 +265,10 @@ def item_meta(it):
 
 def parse_episodes(slug: str):
     """Parse NC streamc episodes from HTML (PA/SN/Vietsub)."""
+    key = f"eps:{slug}"
+    hit = api_cache_get(key)
+    if hit is not None:
+        return hit
     try:
         r = S().get(f"{SITE}/phim/{slug}", impersonate=IMP, timeout=25)
         if r.status_code != 200:
@@ -318,6 +351,7 @@ def parse_episodes(slug: str):
             continue
         seen.add(key)
         out.append(ep)
+    api_cache_put(key, out, DETAIL_TTL)
     return out
 
 
@@ -371,6 +405,10 @@ def score_match(item: dict, title: str, original_title: str, year: str | None) -
 
 
 def tmdb_info(imdb_id: str):
+    key = f"tmdb:{imdb_id}"
+    hit = api_cache_get(key)
+    if hit is not None:
+        return hit
     """TMDB en-US — title tiếng Anh ưu tiên cho Cinemeta."""
     try:
         r = S().get(
@@ -390,7 +428,9 @@ def tmdb_info(imdb_id: str):
                 title = x.get("title") or x.get("name") or ""
                 original = x.get("original_title") or x.get("original_name") or title
                 year = (x.get("release_date") or x.get("first_air_date") or "")[:4]
-                return title, original, year
+                res = (title, original, year)
+                api_cache_put(key, res, TMDB_TTL)
+                return res
     except Exception:
         pass
     return None, None, None
