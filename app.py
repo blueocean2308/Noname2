@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Onflix VPS 1.3.0 — api/search + NC streamc.
+"""Onflix VPS 1.3.2 — StreamC hls + referrer NguonC.
 Match Cinemeta/TMDB: ưu tiên title EN, bỏ keyword CJK làm chính, không items[0].
 CACHE in-memory TTL 10 phút + prune (không ghi đĩa).
 """
@@ -35,7 +35,7 @@ CACHE_TTL = 600
 API_TTL = 300
 DETAIL_TTL = 600
 TMDB_TTL = 86400
-ADDON_VERSION = "1.3.1"
+ADDON_VERSION = "1.3.2"
 
 # CJK / Hangul / Hiragana / Katakana
 _RE_CJK = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]")
@@ -146,18 +146,20 @@ def decrypt_playlist(text, vh):
 
 
 def streamc_m3u8(embed_url: str) -> str:
+    """CS3-style: referrer NguonC + playlist_format hls → preissued, no turnstile."""
     host = urlparse(embed_url).hostname or "embed11.streamc.xyz"
     origin = f"https://{host}"
+    parent = "https://phim.nguonc.com"
     s = S()
     body = {
         "action": "bootstrap",
         "request_grant": True,
-        "playlist_format": "aesgcm-v2",
+        "playlist_format": "hls",
         "bootstrap_format": "aesgcm-v1",
         "pretty_url": True,
         "path_chunks": True,
-        "referrer": "",
-        "frame_origins": [],
+        "referrer": parent + "/",
+        "frame_origins": [parent],
     }
     r = s.post(
         embed_url,
@@ -184,7 +186,13 @@ def streamc_m3u8(embed_url: str) -> str:
     )
     if r2.status_code != 200:
         raise RuntimeError(f"playlist {r2.status_code}")
-    m3u8 = decrypt_playlist(r2.text, plain["video"])
+    body_txt = r2.text
+    if "#ENC-AESGCM" in body_txt:
+        m3u8 = decrypt_playlist(body_txt, plain["video"])
+    else:
+        m3u8 = body_txt
+    if not m3u8.lstrip().startswith("#EXTM3U"):
+        raise RuntimeError("not m3u8")
     out = []
     for line in m3u8.splitlines():
         t = line.strip()
