@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Cno.to VPS addon — TMDB id stream (master HLS, prefer 1080p+).
-1.0.0 — /api/s/{server}/movie|tv + Referer, no web scrape.
+1.0.1 — CNO labels, 4K by width, Tập N episode format.
 """
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ IMP = "chrome131"
 CNO = "https://cno.to"
 PUBLIC_HOST = "168.138.176.147:51823"
 TMDB_KEY = "1adf1a2b5aece0ac5106302d3299f56f"
-ADDON_VERSION = "1.0.0"
+ADDON_VERSION = "1.0.1"
 
 # Stream server ids to try (site rotates; 21 worked in probe)
 SERVER_IDS = [21, 20, 22, 15, 10, 5, 1, 2, 25, 30]
@@ -151,6 +151,7 @@ def parse_master_m3u8(text: str, base: str):
             info = line
             res_m = re.search(r"RESOLUTION=(\d+)x(\d+)", info)
             bw_m = re.search(r"BANDWIDTH=(\d+)", info)
+            w = int(res_m.group(1)) if res_m else 0
             h = int(res_m.group(2)) if res_m else 0
             bw = int(bw_m.group(1)) if bw_m else 0
             if i + 1 < len(lines):
@@ -158,6 +159,7 @@ def parse_master_m3u8(text: str, base: str):
                 if u and not u.startswith("#"):
                     out.append(
                         {
+                            "width": w,
                             "height": h,
                             "bandwidth": bw,
                             "url": urljoin(base, u),
@@ -198,12 +200,15 @@ def fetch_streams(kind: str, tmdb_id: int, season: int | None = None, episode: i
     return [], None
 
 
-def quality_label(h: int) -> str:
-    if h >= 2160:
+def quality_label(w: int, h: int) -> str:
+    # ultrawide 4K often 3840x1600 — use width too
+    if w >= 3840 or h >= 2160:
         return "4K"
-    if h >= 1080:
+    if h >= 1440 or w >= 2560:
+        return "1440p"
+    if h >= 1080 or w >= 1920:
         return "1080p"
-    if h >= 720:
+    if h >= 720 or w >= 1280:
         return "720p"
     if h >= 480:
         return "480p"
@@ -216,8 +221,8 @@ def manifest():
         {
             "id": "org.nuvio.cno.vps",
             "version": ADDON_VERSION,
-            "name": "Cno",
-            "description": "Cno.to streams by TMDB id (1080p+)",
+            "name": "CNO",
+            "description": "CNO (cno.to) streams by TMDB id",
             "resources": ["stream"],
             "types": ["movie", "series"],
             "idPrefixes": ["tt"],
@@ -253,26 +258,37 @@ def stream(stype, sid):
 
     variants, used_path = fetch_streams(kind, tmdb_id, season, episode)
     # keep 720p+ (filter junk); prefer 1080+
-    variants = [v for v in variants if v["height"] >= 720]
+    def is_hd(v):
+        return v.get("height", 0) >= 720 or v.get("width", 0) >= 1280
+
+    def is_fhd(v):
+        return v.get("height", 0) >= 1080 or v.get("width", 0) >= 1920
+
+    variants = [v for v in variants if is_hd(v)]
     if not variants:
         return j({"streams": []})
 
     streams = []
     name_base = title or imdb
     ybit = f" - {year}" if year else ""
-    epbit = ""
     if season is not None and episode is not None:
-        epbit = f" S{season:02d}E{episode:02d}"
+        epbit = f" - Tập {int(episode)}"
+    else:
+        epbit = ""
 
-    for v in variants:
-        if v["height"] < 1080 and any(x["height"] >= 1080 for x in variants):
-            # still allow 720 as fallback only if no 1080+
+    # prefer FHD+; fallback HD
+    chosen = [v for v in variants if is_fhd(v)] or variants[:2]
+    seen_q = set()
+    for v in chosen:
+        q = quality_label(v.get("width", 0), v.get("height", 0))
+        if q in seen_q:
             continue
-        q = quality_label(v["height"])
+        seen_q.add(q)
+        line2 = f"{name_base}{ybit}{epbit}"
         streams.append(
             {
-                "name": f"Cno {q}",
-                "title": f"{name_base}{ybit}{epbit}\n{q}",
+                "name": f"CNO {q}",
+                "title": f"{line2}\n{q}",
                 "url": v["url"],
                 "behaviorHints": {
                     "notWebReady": True,
@@ -287,29 +303,6 @@ def stream(stype, sid):
                 },
             }
         )
-
-    # if all filtered (only 720), take top 2
-    if not streams and variants:
-        for v in variants[:2]:
-            q = quality_label(v["height"])
-            streams.append(
-                {
-                    "name": f"Cno {q}",
-                    "title": f"{name_base}{ybit}{epbit}\n{q}",
-                    "url": v["url"],
-                    "behaviorHints": {
-                        "notWebReady": True,
-                        "bingeGroup": f"cno-{tmdb_id}",
-                        "proxyHeaders": {
-                            "request": {
-                                "Referer": f"{CNO}/",
-                                "Origin": CNO,
-                                "User-Agent": UA,
-                            }
-                        },
-                    },
-                }
-            )
 
     return j({"streams": streams})
 
