@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CNO (cno.to) VPS addon 1.0.2
+"""CNO (cno.to) VPS addon 1.0.3
 - Manifest name CNO
 - Catalog from /api/browse
 - Stream: scan servers 1-40, movie + tv paths
@@ -27,7 +27,7 @@ IMP = "chrome131"
 CNO = "https://cno.to"
 PUBLIC_HOST = "168.138.176.147:51823"
 TMDB_KEY = "1adf1a2b5aece0ac5106302d3299f56f"
-ADDON_VERSION = "1.0.2"
+ADDON_VERSION = "1.0.4"
 SERVER_IDS = list(range(1, 41))
 
 API_CACHE: dict = {}
@@ -169,9 +169,8 @@ def try_one_stream(path: str, referer: str):
         if not body.lstrip().startswith("#EXTM3U"):
             return None
         variants = parse_master_m3u8(body, CNO + path)
-        if not variants:
-            return None
-        return variants
+        # always keep master URL for full audio/sub tracks
+        return {"master": CNO + path, "body": body, "variants": variants or []}
     except Exception:
         return None
 
@@ -195,20 +194,25 @@ def fetch_all_streams(kind: str, tmdb_id: int, season: int | None = None, episod
 
     def work(item):
         sid, path, ref = item
-        variants = try_one_stream(path, ref)
-        return sid, path, variants
+        data = try_one_stream(path, ref)
+        return sid, path, data
 
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    with ThreadPoolExecutor(max_workers=6) as ex:
         futs = [ex.submit(work, p) for p in paths]
         for fut in as_completed(futs):
             try:
-                sid, path, variants = fut.result()
+                sid, path, data = fut.result()
             except Exception:
                 continue
-            if not variants or sid in seen_sid:
+            if not data or sid in seen_sid:
                 continue
             seen_sid.add(sid)
-            found.append({"server": sid, "path": path, "variants": variants})
+            found.append({
+                "server": sid,
+                "path": path,
+                "master": data.get("master"),
+                "variants": data.get("variants") or [],
+            })
 
     found.sort(key=lambda x: x["server"])
     return found
@@ -393,21 +397,22 @@ def stream(stype, sid):
     epbit = f" - Tập {int(episode)}" if episode is not None else ""
 
     for g in groups:
-        variants = g["variants"]
-        # prefer FHD+
-        fhd = [v for v in variants if v.get("height", 0) >= 1080 or v.get("width", 0) >= 1920]
-        pick = fhd or [v for v in variants if v.get("height", 0) >= 720] or variants[:1]
-        # one best quality per server
-        if not pick:
-            continue
-        v = pick[0]
-        q = quality_label(v.get("width", 0), v.get("height", 0))
+        variants = g.get("variants") or []
         srv = g["server"]
+        master = g.get("master") or (CNO + g["path"])
+        # quality from best variant if any
+        fhd = [v for v in variants if v.get("height", 0) >= 1080 or v.get("width", 0) >= 1920]
+        pick = (fhd or variants or [None])[0]
+        if pick:
+            q = quality_label(pick.get("width", 0), pick.get("height", 0))
+        else:
+            q = "HD"
+        # Master only — direct variant often has no audio track for ExoPlayer
         streams.append(
             {
                 "name": f"CNO {q} · S{srv}",
                 "title": f"{name_base}{ybit}{epbit}\n{q} · Server {srv}",
-                "url": v["url"],
+                "url": master,
                 "behaviorHints": {
                     "notWebReady": True,
                     "bingeGroup": f"cno-{tmdb_id}-s{srv}",
