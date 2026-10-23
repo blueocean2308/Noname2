@@ -1,300 +1,323 @@
 #!/usr/bin/env python3
-"""RidoMovies Nuvio addon v1.1.0 — HTML catalog + Closeload embed. Port 51823."""
+"""Cno.to VPS addon — TMDB id stream (master HLS, prefer 1080p+).
+1.0.0 — /api/s/{server}/movie|tv + Referer, no web scrape.
+"""
 from __future__ import annotations
 
-import base64
+import json
 import re
 import time
-from typing import Any, Optional
-from urllib.parse import quote, urljoin, urlparse
+from urllib.parse import urljoin
 
-from flask import Flask, Response, jsonify, request
-
-try:
-    from curl_cffi import requests as cf_requests
-except ImportError:
-    import requests as cf_requests
+from flask import Flask, Response, request
+from curl_cffi import requests as cfreq
 
 app = Flask(__name__)
-VERSION = "1.1.0"
-ADDON_NAME = "Rido"
-BASE = "https://ridomovie.to"
+
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
-CACHE: dict = {}
-CACHE_TTL = 600
+IMP = "chrome131"
+CNO = "https://cno.to"
+PUBLIC_HOST = "168.138.176.147:51823"
+TMDB_KEY = "1adf1a2b5aece0ac5106302d3299f56f"
+ADDON_VERSION = "1.0.0"
+
+# Stream server ids to try (site rotates; 21 worked in probe)
+SERVER_IDS = [21, 20, 22, 15, 10, 5, 1, 2, 25, 30]
+
+API_CACHE: dict = {}
+API_TTL = 300
+TMDB_TTL = 86400
 
 
-def cors(resp: Response) -> Response:
-    resp.headers["Access-Control-Allow-Origin"] = "*"
-    resp.headers["Access-Control-Allow-Headers"] = "*"
-    resp.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
-    return resp
+def S():
+    s = cfreq.Session()
+    s.headers.update(
+        {
+            "User-Agent": UA,
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+    )
+    return s
 
 
-def cached(key: str, producer, ttl: int = CACHE_TTL):
+def j(data, code=200):
+    return Response(
+        json.dumps(data, ensure_ascii=False),
+        status=code,
+        mimetype="application/json",
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "*",
+        },
+    )
+
+
+def public_root():
+    host = request.headers.get("Host") or PUBLIC_HOST
+    if host.startswith("127.") or "localhost" in host:
+        host = PUBLIC_HOST
+    return f"http://{host}"
+
+
+def _prune(store, limit=400):
     now = time.time()
-    if key in CACHE and now - CACHE[key][0] < ttl:
-        return CACHE[key][1]
-    val = producer()
-    CACHE[key] = (now, val)
-    return val
+    for k in [k for k, v in list(store.items()) if v[1] <= now]:
+        store.pop(k, None)
+    if len(store) > limit:
+        for k, _ in sorted(store.items(), key=lambda x: x[1][1])[: max(1, len(store) - limit)]:
+            store.pop(k, None)
 
 
-def http_get(url: str, referer: str | None = None) -> str:
-    headers = {
-        "User-Agent": UA,
-        "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": referer or (BASE + "/home-rd1"),
-    }
-    kwargs = {"headers": headers, "timeout": 25}
+def cache_get(key):
+    item = API_CACHE.get(key)
+    if not item:
+        return None
+    if item[1] <= time.time():
+        API_CACHE.pop(key, None)
+        return None
+    return item[0]
+
+
+def cache_put(key, data, ttl):
+    _prune(API_CACHE)
+    API_CACHE[key] = (data, time.time() + ttl)
+
+
+def cno_get(path: str, prefer_text: bool = False):
+    url = path if path.startswith("http") else f"{CNO}{path}"
+    r = S().get(
+        url,
+        headers={
+            "Referer": f"{CNO}/",
+            "Origin": CNO,
+            "Accept": "application/json, application/vnd.apple.mpegurl, */*",
+        },
+        impersonate=IMP,
+        timeout=20,
+    )
+    if prefer_text:
+        return r.status_code, r.text
     try:
-        r = cf_requests.get(url, impersonate="chrome131", **kwargs)
-    except TypeError:
-        r = cf_requests.get(url, **kwargs)
-    r.raise_for_status()
-    return r.text
+        return r.status_code, r.json()
+    except Exception:
+        return r.status_code, r.text
 
 
-def unpack_packer(source: str) -> str:
-    pattern = re.compile(r"}\('(.+?)',(\d+),(\d+),'(.+?)'\.split\('\|')", re.DOTALL)
-    m = pattern.search(source)
-    if not m:
-        return source
-    payload, radix, keywords = m.group(1), int(m.group(2)), m.group(4).split("|")
-    chars = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-
-    def enc(n: int) -> str:
-        return chars[n] if n < radix else enc(n // radix) + chars[n % radix]
-
-    def repl(mo: re.Match) -> str:
-        tok = mo.group(0)
-        try:
-            idx = int(tok, radix) if radix > 10 else int(tok)
-        except ValueError:
-            return tok
-        if 0 <= idx < len(keywords) and keywords[idx]:
-            return keywords[idx]
-        return tok
-
-    return re.sub(r"\b\w+\b", repl, payload)
-
-
-def extract_packed_scripts(html: str) -> list:
-    scripts = re.findall(r"<script[^>]*>(.*?)</script>", html, re.DOTALL | re.I)
-    return [s for s in scripts if "p,a,c,k,e" in s or ".split('|')" in s]
-
-
-def decode_closeload(embed_url: str) -> Optional[str]:
-    html = http_get(embed_url, referer=BASE + "/")
-    for script in extract_packed_scripts(html):
-        try:
-            decoded = unpack_packer(script)
-        except Exception:
-            decoded = script
-        m = re.search(r'var\s+\w+\s*=\s*"([A-Za-z0-9+/=]+)"', decoded)
-        if not m:
-            m = re.search(r'["\']([A-Za-z0-9+/]{40,}={0,2})["\']', decoded)
-        if not m:
-            continue
-        try:
-            url = base64.b64decode(m.group(1)).decode("utf-8", errors="ignore")
-        except Exception:
-            continue
-        if url.startswith("http"):
-            return url
-    m3 = re.search(r'(https?://[^"\'\s]+\.m3u8[^"\'\s]*)', html)
-    return m3.group(1) if m3 else None
-
-
-def decode_ridoo(embed_url: str) -> Optional[str]:
-    html = http_get(embed_url, referer=BASE + "/")
-    m = re.search(r'file\s*:\s*"([^"]+)"', html) or re.search(r'file:"([^"]+)"', html)
-    if m and m.group(1).startswith("http"):
-        return m.group(1)
-    m3 = re.search(r'(https?://[^"\'\s]+\.m3u8[^"\'\s]*)', html)
-    return m3.group(1) if m3 else None
-
-
-def scrape_list(path: str) -> list:
-    html = http_get(BASE + path)
-    items = []
-    seen = set()
-    for m in re.finditer(
-        r'href=["\']/(movie/[^"\']+|tv/[^"\']+)["\']',
-        html,
-        re.I,
-    ):
-        slug = m.group(1).strip("/")
-        if slug in seen:
-            continue
-        seen.add(slug)
-        name = slug.split("/")[-1].replace("-", " ").title()
-        year = ""
-        ym = re.search(r"(19|20)\d{2}", slug)
-        if ym:
-            year = ym.group(0)
-        typ = "series" if slug.startswith("tv/") else "movie"
-        items.append(
-            {
-                "id": f"rido:{slug}",
-                "type": typ,
-                "name": name,
-                "releaseInfo": year,
-                "poster": None,
-            }
+def tmdb_from_imdb(imdb_id: str):
+    key = f"tmdb:{imdb_id}"
+    hit = cache_get(key)
+    if hit is not None:
+        return hit
+    try:
+        r = S().get(
+            f"https://api.themoviedb.org/3/find/{imdb_id}",
+            params={
+                "api_key": TMDB_KEY,
+                "external_source": "imdb_id",
+                "language": "en-US",
+            },
+            impersonate=IMP,
+            timeout=12,
         )
-    return items
+        d = r.json()
+        if d.get("movie_results"):
+            x = d["movie_results"][0]
+            res = ("movie", int(x["id"]), x.get("title") or "", (x.get("release_date") or "")[:4])
+            cache_put(key, res, TMDB_TTL)
+            return res
+        if d.get("tv_results"):
+            x = d["tv_results"][0]
+            res = ("tv", int(x["id"]), x.get("name") or "", (x.get("first_air_date") or "")[:4])
+            cache_put(key, res, TMDB_TTL)
+            return res
+    except Exception:
+        pass
+    cache_put(key, (None, None, None, None), 600)
+    return None, None, None, None
 
 
-def extract_embeds_from_page(slug: str) -> list:
-    """slug like movie/xxx or tv/xxx"""
-    html = http_get(BASE + "/" + slug.lstrip("/"))
-    embeds = []
-    for pat in [
-        r'data-src=["\'](https?://[^"\']+)["\']',
-        r'iframe[^>]+src=["\'](https?://[^"\']+)["\']',
-        r'(https?://closeload\.top/[^"\'\s<>]+)',
-        r'(https?://[^"\'\s]*ridoo[^"\'\s]*)',
-    ]:
-        for u in re.findall(pat, html, re.I):
-            if u not in embeds and u.startswith("http"):
-                embeds.append(u)
-    return embeds
+def parse_master_m3u8(text: str, base: str):
+    """Return list of {res, bandwidth, url} from master playlist, highest first."""
+    out = []
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if line.startswith("#EXT-X-STREAM-INF:"):
+            info = line
+            res_m = re.search(r"RESOLUTION=(\d+)x(\d+)", info)
+            bw_m = re.search(r"BANDWIDTH=(\d+)", info)
+            h = int(res_m.group(2)) if res_m else 0
+            bw = int(bw_m.group(1)) if bw_m else 0
+            if i + 1 < len(lines):
+                u = lines[i + 1].strip()
+                if u and not u.startswith("#"):
+                    out.append(
+                        {
+                            "height": h,
+                            "bandwidth": bw,
+                            "url": urljoin(base, u),
+                        }
+                    )
+            i += 2
+            continue
+        i += 1
+    out.sort(key=lambda x: (x["height"], x["bandwidth"]), reverse=True)
+    return out
 
 
-def resolve_streams(slug: str) -> list:
-    streams = []
-    for emb in extract_embeds_from_page(slug):
-        host = (urlparse(emb).hostname or "").lower()
+def fetch_streams(kind: str, tmdb_id: int, season: int | None = None, episode: int | None = None):
+    """kind: movie | tv. Returns list of variant dicts from first working server."""
+    paths = []
+    if kind == "movie":
+        for sid in SERVER_IDS:
+            paths.append(f"/api/s/{sid}/movie/{tmdb_id}?v=3")
+    else:
+        s, e = season or 1, episode or 1
+        for sid in SERVER_IDS:
+            paths.append(f"/api/s/{sid}/tv/{tmdb_id}/{s}/{e}?v=3")
+            paths.append(f"/api/s/{sid}/tv/{tmdb_id}?season={s}&episode={e}&v=3")
+            paths.append(f"/api/s/{sid}/series/{tmdb_id}/{s}/{e}?v=3")
+
+    for path in paths:
         try:
-            if "closeload" in host:
-                m3u8 = decode_closeload(emb)
-                if m3u8:
-                    streams.append(
-                        {
-                            "name": "Rido",
-                            "title": "Closeload\nFHD",
-                            "url": m3u8,
-                            "behaviorHints": {
-                                "notWebReady": True,
-                                "bingeGroup": f"rido-cl-{slug}",
-                                "proxyHeaders": {
-                                    "request": {
-                                        "Referer": "https://closeload.top/",
-                                        "Origin": "https://closeload.top",
-                                        "User-Agent": UA,
-                                    }
-                                },
-                            },
-                        }
-                    )
-            elif "ridoo" in host or "rapid" in host:
-                m3u8 = decode_ridoo(emb)
-                if m3u8:
-                    streams.append(
-                        {
-                            "name": "Rido",
-                            "title": "RidoRapid\nFHD",
-                            "url": m3u8,
-                            "behaviorHints": {
-                                "notWebReady": True,
-                                "bingeGroup": f"rido-rp-{slug}",
-                                "proxyHeaders": {
-                                    "request": {
-                                        "Referer": BASE + "/",
-                                        "User-Agent": UA,
-                                    }
-                                },
-                            },
-                        }
-                    )
-        except Exception as e:
-            app.logger.warning("embed fail %s: %s", emb, e)
-    return streams
+            code, body = cno_get(path, prefer_text=True)
+            if code != 200 or not isinstance(body, str):
+                continue
+            if not body.lstrip().startswith("#EXTM3U"):
+                continue
+            variants = parse_master_m3u8(body, CNO + path)
+            if variants:
+                return variants, path
+        except Exception:
+            continue
+    return [], None
 
 
-@app.route("/")
-@app.route("/manifest.json")
+def quality_label(h: int) -> str:
+    if h >= 2160:
+        return "4K"
+    if h >= 1080:
+        return "1080p"
+    if h >= 720:
+        return "720p"
+    if h >= 480:
+        return "480p"
+    return f"{h}p" if h else "HD"
+
+
+@app.get("/manifest.json")
 def manifest():
-    return cors(
-        jsonify(
-            {
-                "id": "community.rido.streams",
-                "version": VERSION,
-                "name": ADDON_NAME,
-                "description": "RidoMovies — Closeload + RidoRapid (HTML)",
-                "resources": ["catalog", "meta", "stream"],
-                "types": ["movie", "series"],
-                "idPrefixes": ["rido:"],
-                "catalogs": [
-                    {
-                        "type": "movie",
-                        "id": "rido-movies",
-                        "name": "Rido Movies",
-                    },
-                    {
-                        "type": "series",
-                        "id": "rido-series",
-                        "name": "Rido Series",
-                    },
-                ],
-            }
-        )
+    return j(
+        {
+            "id": "org.nuvio.cno.vps",
+            "version": ADDON_VERSION,
+            "name": "Cno",
+            "description": "Cno.to streams by TMDB id (1080p+)",
+            "resources": ["stream"],
+            "types": ["movie", "series"],
+            "idPrefixes": ["tt"],
+            "catalogs": [],
+        }
     )
 
 
-@app.route("/catalog/<type_>/<id_>.json")
-@app.route("/catalog/<type_>/<id_>/skip=<int:skip>.json")
-def catalog(type_, id_, skip=0):
-    def _load():
-        if id_ == "rido-series" or type_ == "series":
-            return scrape_list("/tv-series-rd1")
-        return scrape_list("/movies-rd1")
+@app.get("/stream/<stype>/<sid>")
+def stream(stype, sid):
+    sid = sid.replace(".json", "")
+    season = episode = None
+    imdb = sid
 
-    items = cached(f"cat:{id_}", _load, 300)
-    metas = items[skip : skip + 100]
-    return cors(jsonify({"metas": metas}))
+    if stype == "series" and ":" in sid:
+        parts = sid.split(":")
+        imdb = parts[0]
+        if len(parts) >= 3:
+            season, episode = int(parts[1]), int(parts[2])
 
+    if not imdb.startswith("tt"):
+        return j({"streams": []})
 
-@app.route("/meta/<type_>/<path:id_>.json")
-def meta(type_, id_):
-    slug = id_[5:] if id_.startswith("rido:") else id_
-    name = slug.split("/")[-1].replace("-", " ").title()
-    return cors(
-        jsonify(
-            {
-                "meta": {
-                    "id": f"rido:{slug}",
-                    "type": type_,
-                    "name": name,
-                    "description": f"Rido: {name}",
-                }
-            }
-        )
-    )
+    kind, tmdb_id, title, year = tmdb_from_imdb(imdb)
+    if not tmdb_id:
+        return j({"streams": []})
 
+    # prefer path matching stype
+    if stype == "movie":
+        kind = "movie"
+    elif stype == "series":
+        kind = "tv"
 
-@app.route("/stream/<type_>/<path:id_>.json")
-def stream(type_, id_):
-    slug = id_[5:] if id_.startswith("rido:") else id_
-    # strip season/episode suffix if present
-    parts = slug.split(":")
-    if len(parts) >= 3 and parts[-2].isdigit() and parts[-1].isdigit():
-        slug = ":".join(parts[:-2])
+    variants, used_path = fetch_streams(kind, tmdb_id, season, episode)
+    # keep 720p+ (filter junk); prefer 1080+
+    variants = [v for v in variants if v["height"] >= 720]
+    if not variants:
+        return j({"streams": []})
+
     streams = []
-    if slug and ("/" in slug or slug.startswith("movie") or slug.startswith("tv")):
-        streams = cached(f"stream:{slug}", lambda: resolve_streams(slug), 300)
-    return cors(jsonify({"streams": streams}))
+    name_base = title or imdb
+    ybit = f" - {year}" if year else ""
+    epbit = ""
+    if season is not None and episode is not None:
+        epbit = f" S{season:02d}E{episode:02d}"
+
+    for v in variants:
+        if v["height"] < 1080 and any(x["height"] >= 1080 for x in variants):
+            # still allow 720 as fallback only if no 1080+
+            continue
+        q = quality_label(v["height"])
+        streams.append(
+            {
+                "name": f"Cno {q}",
+                "title": f"{name_base}{ybit}{epbit}\n{q}",
+                "url": v["url"],
+                "behaviorHints": {
+                    "notWebReady": True,
+                    "bingeGroup": f"cno-{tmdb_id}",
+                    "proxyHeaders": {
+                        "request": {
+                            "Referer": f"{CNO}/",
+                            "Origin": CNO,
+                            "User-Agent": UA,
+                        }
+                    },
+                },
+            }
+        )
+
+    # if all filtered (only 720), take top 2
+    if not streams and variants:
+        for v in variants[:2]:
+            q = quality_label(v["height"])
+            streams.append(
+                {
+                    "name": f"Cno {q}",
+                    "title": f"{name_base}{ybit}{epbit}\n{q}",
+                    "url": v["url"],
+                    "behaviorHints": {
+                        "notWebReady": True,
+                        "bingeGroup": f"cno-{tmdb_id}",
+                        "proxyHeaders": {
+                            "request": {
+                                "Referer": f"{CNO}/",
+                                "Origin": CNO,
+                                "User-Agent": UA,
+                            }
+                        },
+                    },
+                }
+            )
+
+    return j({"streams": streams})
 
 
-@app.route("/health")
-def health():
-    return cors(jsonify({"ok": True, "version": VERSION, "base": BASE}))
+@app.get("/")
+def root():
+    return j({"ok": True, "version": ADDON_VERSION, "manifest": "/manifest.json"})
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=51823, debug=False)
+    app.run(host="0.0.0.0", port=51823, threaded=True)
