@@ -27,7 +27,7 @@ IMP = "chrome131"
 CNO = "https://cno.to"
 PUBLIC_HOST = "168.138.176.147:51823"
 TMDB_KEY = "1adf1a2b5aece0ac5106302d3299f56f"
-ADDON_VERSION = "1.0.4"
+ADDON_VERSION = "1.0.5"
 SERVER_IDS = list(range(1, 41))
 
 API_CACHE: dict = {}
@@ -124,6 +124,50 @@ def tmdb_from_imdb(imdb_id: str):
     return None, None, None, None
 
 
+
+def tmdb_external_imdb(kind: str, tmdb_id: int):
+    key = f"ext:{kind}:{tmdb_id}"
+    hit = cache_get(key)
+    if hit is not None:
+        return hit
+    try:
+        path = f"https://api.themoviedb.org/3/{'tv' if kind=='tv' else 'movie'}/{tmdb_id}/external_ids"
+        r = S().get(path, params={"api_key": TMDB_KEY}, impersonate=IMP, timeout=12)
+        d = r.json()
+        imdb = d.get("imdb_id") or ""
+        cache_put(key, imdb, TMDB_TTL)
+        return imdb
+    except Exception:
+        cache_put(key, "", 600)
+        return ""
+
+
+def parse_media_id(mid: str):
+    """Return (kind, tmdb_id, imdb_or_none, season, episode) from tt / tt:s:e / cno:movie:id / cno:tv:id."""
+    season = episode = None
+    mid = mid.replace(".json", "")
+    if mid.startswith("cno:"):
+        parts = mid.split(":")
+        # cno:movie:123 or cno:tv:123
+        if len(parts) >= 3:
+            kind = "tv" if parts[1] == "tv" else "movie"
+            try:
+                tmdb_id = int(parts[2])
+            except Exception:
+                return None, None, None, None, None
+            return kind, tmdb_id, None, season, episode
+        return None, None, None, None, None
+    if mid.startswith("tt"):
+        imdb = mid
+        if ":" in mid:
+            parts = mid.split(":")
+            imdb = parts[0]
+            if len(parts) >= 3:
+                season, episode = int(parts[1]), int(parts[2])
+        kind, tmdb_id, title, year = tmdb_from_imdb(imdb)
+        return kind, tmdb_id, imdb, season, episode
+    return None, None, None, None, None
+
 def quality_label(w: int, h: int) -> str:
     if w >= 3840 or h >= 2160:
         return "4K"
@@ -218,7 +262,7 @@ def fetch_all_streams(kind: str, tmdb_id: int, season: int | None = None, episod
     return found
 
 
-def item_to_meta(item: dict):
+def item_to_meta(item: dict, resolve_imdb: bool = False):
     t = item.get("type") or "movie"
     tid = item.get("id")
     name = item.get("title") or ""
@@ -227,6 +271,8 @@ def item_to_meta(item: dict):
     if poster and poster.startswith("/"):
         poster = f"https://image.tmdb.org/t/p/w500{poster}"
     imdb = item.get("imdbId") or ""
+    if resolve_imdb and not imdb and tid:
+        imdb = tmdb_external_imdb("tv" if t == "tv" else "movie", int(tid)) or ""
     meta_id = imdb if imdb else f"cno:{t}:{tid}"
     return {
         "id": meta_id,
@@ -297,87 +343,72 @@ def catalog(ctype, cid, extra=""):
         code, data = cno_get(f"/api/browse?type={api_type}&page={page}")
         results = data.get("results") if isinstance(data, dict) and code == 200 else []
 
-    metas = [item_to_meta(x) for x in (results or [])[:40]]
+    metas = [item_to_meta(x, resolve_imdb=True) for x in (results or [])[:24]]
     return j({"metas": metas})
 
 
 @app.get("/meta/<mtype>/<mid>")
 def meta(mtype, mid):
     mid = mid.replace(".json", "")
-    if mid.startswith("tt"):
-        kind, tmdb_id, title, year = tmdb_from_imdb(mid)
-        if not tmdb_id:
-            return j({"meta": {}})
-        api_kind = "tv" if kind == "tv" else "movie"
-        code, data = cno_get(f"/api/{api_kind}/{tmdb_id}")
-        if code != 200 or not isinstance(data, dict):
-            return j(
-                {
-                    "meta": {
-                        "id": mid,
-                        "type": "series" if kind == "tv" else "movie",
-                        "name": title,
-                        "releaseInfo": year,
-                    }
+    kind, tmdb_id, imdb, season, episode = parse_media_id(mid)
+    if not tmdb_id:
+        return j({"meta": {}})
+    title = year = ""
+    if imdb:
+        _, _, title, year = tmdb_from_imdb(imdb)
+    api_kind = "tv" if kind == "tv" else "movie"
+    code, data = cno_get(f"/api/{api_kind}/{tmdb_id}")
+    if code != 200 or not isinstance(data, dict):
+        return j(
+            {
+                "meta": {
+                    "id": imdb or mid,
+                    "type": "series" if kind == "tv" else "movie",
+                    "name": title or str(tmdb_id),
+                    "releaseInfo": year,
                 }
-            )
-        data["imdbId"] = mid
-        meta_obj = item_to_meta(data)
-        meta_obj["id"] = mid
-        if kind == "tv":
-            code2, season = cno_get(f"/api/tv/{tmdb_id}/season/1")
-            videos = []
-            if isinstance(season, dict):
-                for ep in season.get("episodes") or []:
-                    se, ee = ep.get("season") or 1, ep.get("episode") or 1
-                    videos.append(
-                        {
-                            "id": f"{mid}:{se}:{ee}",
-                            "title": ep.get("title") or f"Tập {ee}",
-                            "season": se,
-                            "episode": ee,
-                            "released": ep.get("date") or "",
-                        }
-                    )
-            # try more seasons if seasons count > 1
-            seasons_n = int(data.get("seasons") or 1)
-            for sn in range(2, min(seasons_n, 8) + 1):
-                code3, sdata = cno_get(f"/api/tv/{tmdb_id}/season/{sn}")
-                if not isinstance(sdata, dict):
-                    continue
-                for ep in sdata.get("episodes") or []:
-                    se, ee = ep.get("season") or sn, ep.get("episode") or 1
-                    videos.append(
-                        {
-                            "id": f"{mid}:{se}:{ee}",
-                            "title": ep.get("title") or f"Tập {ee}",
-                            "season": se,
-                            "episode": ee,
-                            "released": ep.get("date") or "",
-                        }
-                    )
-            meta_obj["videos"] = videos
-        return j({"meta": meta_obj})
-    return j({"meta": {}})
-
+            }
+        )
+    if imdb:
+        data["imdbId"] = imdb
+    meta_obj = item_to_meta(data, resolve_imdb=not bool(imdb))
+    meta_obj["id"] = imdb or meta_obj["id"]
+    if kind == "tv":
+        videos = []
+        seasons_n = int(data.get("seasons") or 1)
+        for sn in range(1, min(seasons_n, 8) + 1):
+            code3, sdata = cno_get(f"/api/tv/{tmdb_id}/season/{sn}")
+            if not isinstance(sdata, dict):
+                continue
+            for ep in sdata.get("episodes") or []:
+                se, ee = ep.get("season") or sn, ep.get("episode") or 1
+                base = meta_obj["id"]
+                videos.append(
+                    {
+                        "id": f"{base}:{se}:{ee}",
+                        "title": ep.get("title") or f"Tập {ee}",
+                        "season": se,
+                        "episode": ee,
+                        "released": ep.get("date") or "",
+                    }
+                )
+        meta_obj["videos"] = videos
+    return j({"meta": meta_obj})
 
 @app.get("/stream/<stype>/<sid>")
 def stream(stype, sid):
     sid = sid.replace(".json", "")
-    season = episode = None
-    imdb = sid
-    if stype == "series" and ":" in sid:
+    kind, tmdb_id, imdb, season, episode = parse_media_id(sid)
+    # series tt:1:2 already parsed; cno has no season in id path from meta videos using tt:s:e
+    if stype == "series" and sid.startswith("tt") and sid.count(":") >= 2:
         parts = sid.split(":")
-        imdb = parts[0]
-        if len(parts) >= 3:
+        if season is None and len(parts) >= 3:
             season, episode = int(parts[1]), int(parts[2])
-
-    if not imdb.startswith("tt"):
-        return j({"streams": []})
-
-    kind, tmdb_id, title, year = tmdb_from_imdb(imdb)
     if not tmdb_id:
         return j({"streams": []})
+    title = year = ""
+    if imdb:
+        _, _, title, year = tmdb_from_imdb(imdb)
     if stype == "movie":
         kind = "movie"
     elif stype == "series":
@@ -392,7 +423,7 @@ def stream(stype, sid):
         cache_put(cache_key, groups, API_TTL)
 
     streams = []
-    name_base = title or imdb
+    name_base = title or imdb or str(tmdb_id)
     ybit = f" - {year}" if year else ""
     epbit = f" - Tập {int(episode)}" if episode is not None else ""
 
