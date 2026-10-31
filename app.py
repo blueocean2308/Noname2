@@ -16,7 +16,7 @@ from flask import Flask, Response, jsonify, request
 app = Flask(__name__)
 
 PORT = 51823
-VERSION = "1.0.5"
+VERSION = "1.0.6"
 ADDON_NAME = "Fprime"
 ADDON_ID = "org.nuvio.fprime"
 
@@ -382,7 +382,10 @@ def hls_proxy():
     raw = upstream.content or b""
     ctype = (upstream.headers.get("Content-Type") or "").lower()
 
-    if raw[:7] == b"#EXTM3U" or "mpegurl" in ctype or "m3u8" in target:
+    # CHỈ coi là playlist khi BODY là m3u8 — KHÔNG dùng "m3u8" in URL
+    # (CDN path chứa storagem3u8/.../file.jpg → trước đây bị nhầm thành playlist)
+    is_playlist = raw[:7] == b"#EXTM3U" or "mpegurl" in ctype
+    if is_playlist:
         text = raw.decode("utf-8", errors="ignore")
         out = []
         for line in text.splitlines():
