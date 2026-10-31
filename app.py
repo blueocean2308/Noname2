@@ -1,477 +1,529 @@
 #!/usr/bin/env python3
-"""Koddo native addon for Nuvio/Stremio — catalog + 1080p streams only."""
+"""Fprime Stremio/Nuvio addon — catalog + streams (Storage + Astra AES-GCM)."""
 
 from __future__ import annotations
 
-import json
-import os
 import re
 import time
-from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote, unquote
+from typing import Any, Optional
+from urllib.parse import quote
 
+import requests
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from flask import Flask, Response, jsonify, request
-
-try:
-    from curl_cffi import requests as cffi_requests
-    HAS_CFFI = True
-except Exception:
-    import requests as cffi_requests
-    HAS_CFFI = False
-
-APP_NAME = "Koddo"
-APP_ID = "org.nuvio.koddo"
-VERSION = "1.0.0"
-PORT = int(os.environ.get("PORT", "51823"))
-KODDO = "https://koddo.to"
-CDN = "https://useamass.cyou"
-MIN_HEIGHT = 1080
-COOKIE = os.environ.get("KODDO_COOKIE", "").strip()
-
-UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/131.0.0.0 Safari/537.36"
-)
-
-CACHE_TTL = 600
-_cache: Dict[str, Tuple[float, Any]] = {}
 
 app = Flask(__name__)
 
+PORT = 51823
+VERSION = "1.0.0"
+ADDON_NAME = "Fprime"
+ADDON_ID = "org.nuvio.fprime"
 
-def _cors(resp: Response) -> Response:
+TMDB = "https://db.insidethisplaceiswarm.cc/3"
+STORAGE = "https://storage.insidethisplaceiswarm.cc/content"
+ASTRA = "https://serverone.insidethisplaceiswarm.cc/astra"
+ASTRA_KEY = bytes.fromhex(
+    "cc668a8304b57864709efdfc0051a619e146c0c8b486f190a06d1c1cf96af698"
+)
+IMG = "https://image.tmdb.org/t/p"
+
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+SESSION = requests.Session()
+SESSION.headers.update(
+    {
+        "User-Agent": UA,
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://fprime.at/",
+        "Origin": "https://fprime.at",
+    }
+)
+
+CACHE: dict[str, tuple[float, Any]] = {}
+CACHE_TTL = 900
+
+
+def cors(resp: Response) -> Response:
     resp.headers["Access-Control-Allow-Origin"] = "*"
     resp.headers["Access-Control-Allow-Headers"] = "*"
-    resp.headers["Access-Control-Allow-Methods"] = "GET,HEAD,OPTIONS"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    resp.headers["Content-Type"] = "application/json; charset=utf-8"
     return resp
 
 
-@app.after_request
-def after(resp: Response) -> Response:
-    return _cors(resp)
-
-
-def cache_get(key: str) -> Any:
-    item = _cache.get(key)
-    if not item:
-        return None
-    ts, val = item
-    if time.time() - ts > CACHE_TTL:
-        _cache.pop(key, None)
-        return None
+def cached(key: str, fn, ttl: int = CACHE_TTL):
+    now = time.time()
+    hit = CACHE.get(key)
+    if hit and now - hit[0] < ttl:
+        return hit[1]
+    val = fn()
+    CACHE[key] = (now, val)
     return val
 
 
-def cache_set(key: str, val: Any) -> Any:
-    _cache[key] = (time.time(), val)
-    return val
-
-
-def http_get(url: str, accept: str = "application/json", extra: Optional[dict] = None) -> Tuple[int, Any]:
-    headers = {
-        "User-Agent": UA,
-        "Accept": accept,
-        "Accept-Language": "en-US,en;q=0.9,vi;q=0.8",
-        "Referer": f"{KODDO}/",
-        "Origin": KODDO,
-        "Cache-Control": "no-cache",
-    }
-    if COOKIE:
-        headers["Cookie"] = COOKIE
-    if extra:
-        headers.update(extra)
+def get_json(url: str, timeout: int = 15) -> Optional[dict]:
     try:
-        if HAS_CFFI:
-            r = cffi_requests.get(url, headers=headers, timeout=25, impersonate="chrome131")
-        else:
-            r = cffi_requests.get(url, headers=headers, timeout=25)
-        ct = (r.headers.get("content-type") or "").lower()
-        if "json" in ct or accept.startswith("application/json"):
-            try:
-                return r.status_code, r.json()
-            except Exception:
-                return r.status_code, r.text
-        return r.status_code, r.text
-    except Exception as e:
-        return 0, str(e)
-
-
-def search_koddo(query: str) -> List[dict]:
-    q = (query or "").strip()
-    if not q:
-        return []
-    key = f"search:{q.lower()}"
-    hit = cache_get(key)
-    if hit is not None:
-        return hit
-    st, data = http_get(f"{KODDO}/v1/search/{quote(q)}?lang=en")
-    results = []
-    if st == 200 and isinstance(data, dict):
-        results = data.get("results") or []
-    return cache_set(key, results)
-
-
-def get_title(kind: str, kid: str) -> Optional[dict]:
-    key = f"title:{kind}:{kid}"
-    hit = cache_get(key)
-    if hit is not None:
-        return hit
-    path = "movies" if kind == "movie" else "series"
-    st, data = http_get(f"{KODDO}/v1/{path}/{kid}?lang=en")
-    if st == 200 and isinstance(data, dict) and data.get("id"):
-        return cache_set(key, data)
+        r = SESSION.get(url, timeout=timeout)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
     return None
 
 
-def provider_items(slug: str = "netflix") -> List[dict]:
-    key = f"prov:{slug}"
-    hit = cache_get(key)
-    if hit is not None:
-        return hit
-    st, data = http_get(f"{KODDO}/v1/provider/{slug}?kind=iconic&lang=en")
-    items = []
-    if st == 200 and isinstance(data, dict):
-        items = data.get("items") or data.get("results") or []
-    elif st == 200 and isinstance(data, list):
-        items = data
-    return cache_set(key, items)
+def decrypt_astra(enc: str) -> Optional[str]:
+    try:
+        if enc.startswith("as_"):
+            enc = enc[3:]
+        raw = bytes.fromhex(enc)
+        if len(raw) < 28:
+            return None
+        iv, ct = raw[:12], raw[12:]
+        plain = AESGCM(ASTRA_KEY).decrypt(iv, ct, None)
+        return plain.decode("utf-8", errors="ignore")
+    except Exception:
+        return None
 
 
-def meta_from_item(item: dict, type_hint: Optional[str] = None) -> dict:
-    kind = item.get("kind") or type_hint or "movie"
-    stype = "series" if kind == "series" else "movie"
-    kid = item.get("id") or ""
-    year = item.get("year")
+def imdb_to_tmdb(imdb_id: str) -> Optional[tuple[str, int]]:
+    def _fetch():
+        data = get_json(
+            f"{TMDB}/find/{imdb_id}?external_source=imdb_id&language=en-US"
+        )
+        if not data:
+            return None
+        for key, mtype in (("movie_results", "movie"), ("tv_results", "tv")):
+            arr = data.get(key) or []
+            if arr:
+                return mtype, int(arr[0]["id"])
+        return None
+
+    return cached(f"imdb:{imdb_id}", _fetch, 3600)
+
+
+def parse_stream_id(sid: str) -> Optional[dict]:
+    sid = sid.replace(".json", "").strip()
+    if sid.startswith("tmdb:"):
+        parts = sid.split(":")
+        if len(parts) == 3 and parts[1] in ("movie", "tv"):
+            return {"type": parts[1], "tmdb": int(parts[2])}
+        if len(parts) == 5 and parts[1] == "tv":
+            return {
+                "type": "tv",
+                "tmdb": int(parts[2]),
+                "season": int(parts[3]),
+                "episode": int(parts[4]),
+            }
+        return None
+
+    m = re.match(r"^(tt\d+)(?::(\d+):(\d+))?$", sid)
+    if not m:
+        return None
+    imdb = m.group(1)
+    mapped = imdb_to_tmdb(imdb)
+    if not mapped:
+        return None
+    mtype, tid = mapped
+    out = {"type": mtype, "tmdb": tid, "imdb": imdb}
+    if m.group(2) and m.group(3):
+        out["season"] = int(m.group(2))
+        out["episode"] = int(m.group(3))
+        out["type"] = "tv"
+    return out
+
+
+def poster_url(path: Optional[str], size: str = "w500") -> Optional[str]:
+    if not path:
+        return None
+    return f"{IMG}/{size}{path}"
+
+
+def meta_from_tmdb(item: dict, media_type: str) -> dict:
+    tid = item.get("id")
+    title = item.get("title") or item.get("name") or "Unknown"
+    year = (item.get("release_date") or item.get("first_air_date") or "")[:4]
+    ext = item.get("external_ids") or {}
+    imdb = ext.get("imdb_id")
+    mid = imdb or f"tmdb:{media_type}:{tid}"
     meta = {
-        "id": f"koddo:{stype}:{kid}",
-        "type": stype,
-        "name": item.get("name") or kid,
-        "poster": item.get("poster"),
-        "background": item.get("backdrop") or item.get("poster"),
-        "logo": item.get("logo"),
-        "description": item.get("description") or "",
-        "releaseInfo": str(year) if year else "",
-        "imdbRating": str(item.get("rating")) if item.get("rating") else None,
-        "genres": item.get("tags") or [],
+        "id": mid,
+        "type": "movie" if media_type == "movie" else "series",
+        "name": title,
+        "poster": poster_url(item.get("poster_path")),
+        "background": poster_url(item.get("backdrop_path"), "w1280"),
+        "description": item.get("overview") or "",
+        "releaseInfo": year,
+        "imdbRating": str(round(item.get("vote_average") or 0, 1))
+        if item.get("vote_average")
+        else None,
+        "genres": [g["name"] for g in (item.get("genres") or []) if g.get("name")],
     }
     return {k: v for k, v in meta.items() if v is not None}
 
 
-def build_series_videos(title: dict) -> List[dict]:
-    videos = []
-    kid = title.get("id")
-    seasons = title.get("seasons") or []
-    prefetch = title.get("prefetch_episodes") or []
-    pref_season = title.get("prefetch_season") or 1
-    pref_map = {int(e.get("episode") or 0): e for e in prefetch if isinstance(e, dict)}
+def catalog_item(item: dict) -> Optional[dict]:
+    mtype = item.get("media_type") or ("movie" if "title" in item else "tv")
+    if mtype not in ("movie", "tv"):
+        return None
+    title = item.get("title") or item.get("name")
+    if not title:
+        return None
+    year = (item.get("release_date") or item.get("first_air_date") or "")[:4]
+    return {
+        "id": f"tmdb:{mtype}:{item['id']}",
+        "type": "movie" if mtype == "movie" else "series",
+        "name": title,
+        "poster": poster_url(item.get("poster_path")),
+        "background": poster_url(item.get("backdrop_path"), "w1280"),
+        "description": item.get("overview") or "",
+        "releaseInfo": year,
+    }
 
-    for s in seasons:
-        if not isinstance(s, dict):
-            continue
-        sn = int(s.get("season") or 0)
-        count = int(s.get("released_episode_count") or s.get("episode_count") or 0)
-        for ep in range(1, max(count, 0) + 1):
-            info = pref_map.get(ep) if sn == int(pref_season) else None
-            title_ep = (info or {}).get("name") or f"Tap {ep}"
-            videos.append(
+
+def fetch_master_variants(url: str) -> list[dict]:
+    try:
+        r = SESSION.get(
+            url,
+            timeout=12,
+            headers={"Referer": "https://fprime.at/", "User-Agent": UA},
+        )
+        if r.status_code != 200:
+            return [{"url": url, "quality": "AUTO", "height": 0}]
+        text = r.text
+        if "#EXT-X-STREAM-INF" not in text:
+            return [{"url": url, "quality": "AUTO", "height": 0}]
+        lines = text.splitlines()
+        variants = []
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            if line.startswith("#EXT-X-STREAM-INF"):
+                height = 0
+                m = re.search(r"RESOLUTION=(\d+)x(\d+)", line)
+                if m:
+                    height = int(m.group(2))
+                bw = 0
+                mb = re.search(r"BANDWIDTH=(\d+)", line)
+                if mb:
+                    bw = int(mb.group(1))
+                if i + 1 < len(lines):
+                    stream_url = lines[i + 1].strip()
+                    if stream_url and not stream_url.startswith("#"):
+                        if stream_url.startswith("http"):
+                            full = stream_url
+                        else:
+                            base = url.rsplit("/", 1)[0]
+                            full = base + "/" + stream_url.lstrip("/")
+                        variants.append(
+                            {"url": full, "height": height, "bandwidth": bw}
+                        )
+                i += 2
+            else:
+                i += 1
+        good = [v for v in variants if v["height"] >= 1080]
+        if not good:
+            if variants:
+                variants.sort(
+                    key=lambda x: (x["height"], x["bandwidth"]), reverse=True
+                )
+                top = variants[0]
+                q = f"{top['height']}p" if top["height"] else "AUTO"
+                return [{"url": top["url"], "quality": q, "height": top["height"]}]
+            return [{"url": url, "quality": "AUTO", "height": 0}]
+        good.sort(key=lambda x: (x["height"], x["bandwidth"]), reverse=True)
+        out = []
+        for v in good:
+            if v["height"] >= 2160:
+                q = "4K"
+            elif v["height"] >= 1440:
+                q = "1440p"
+            else:
+                q = "1080p"
+            out.append({"url": v["url"], "quality": q, "height": v["height"]})
+        return out
+    except Exception:
+        return [{"url": url, "quality": "AUTO", "height": 0}]
+
+
+def get_storage_url(
+    mtype: str, tmdb: int, season: int = 0, episode: int = 0
+) -> Optional[str]:
+    if mtype == "movie":
+        data = get_json(f"{STORAGE}/movie/{tmdb}")
+    else:
+        data = get_json(f"{STORAGE}/tv/{tmdb}/{season}/{episode}")
+    if data and data.get("found") and data.get("url"):
+        return data["url"]
+    return None
+
+
+def get_astra_url(
+    mtype: str, tmdb: int, season: int = 0, episode: int = 0
+) -> Optional[str]:
+    if mtype == "movie":
+        url = f"{ASTRA}?tmdbId={tmdb}&type=movie"
+    else:
+        url = f"{ASTRA}?tmdbId={tmdb}&type=tv&season={season}&episode={episode}"
+    data = get_json(url)
+    if not data:
+        return None
+    enc = (data.get("sources") or {}).get("Astra", {}).get("url")
+    if not enc:
+        return None
+    return decrypt_astra(enc)
+
+
+def build_streams(info: dict) -> list[dict]:
+    mtype = info["type"]
+    tmdb = info["tmdb"]
+    season = info.get("season") or 0
+    episode = info.get("episode") or 0
+    streams: list[dict] = []
+    seen = set()
+
+    sources = []
+    storage = get_storage_url(mtype, tmdb, season, episode)
+    if storage:
+        sources.append(("Storage", storage))
+    astra = get_astra_url(mtype, tmdb, season, episode)
+    if astra:
+        sources.append(("Astra", astra))
+
+    for server, raw_url in sources:
+        variants = fetch_master_variants(raw_url)
+        for v in variants:
+            if v["height"] and v["height"] < 1080:
+                continue
+            u = v["url"]
+            if u in seen:
+                continue
+            seen.add(u)
+            q = v["quality"]
+            if episode:
+                title = f"Tập {episode}\n{q} · {server}"
+            else:
+                title = f"{q} · {server}"
+            streams.append(
                 {
-                    "id": f"koddo:series:{kid}:{sn}:{ep}",
-                    "title": title_ep,
-                    "season": sn,
-                    "episode": ep,
-                    "released": (info or {}).get("air_date") or "",
-                    "thumbnail": (info or {}).get("still"),
-                    "overview": (info or {}).get("description") or "",
+                    "name": f"Fprime {q}",
+                    "title": title,
+                    "url": u,
+                    "behaviorHints": {
+                        "notWebReady": False,
+                        "bingeGroup": f"fprime-{tmdb}-{season}-{episode}-{server}",
+                        "proxyHeaders": {
+                            "request": {
+                                "Referer": "https://fprime.at/",
+                                "Origin": "https://fprime.at/",
+                                "User-Agent": UA,
+                            }
+                        },
+                    },
                 }
             )
-    return videos
-
-
-def parse_stream_id(video_id: str) -> Optional[Tuple[str, str, int, int]]:
-    video_id = unquote(video_id or "").replace(".json", "")
-    if video_id.startswith("koddo:"):
-        parts = video_id.split(":")
-        if len(parts) >= 3 and parts[1] == "movie":
-            return "movie", parts[2], 0, 0
-        if len(parts) >= 5 and parts[1] == "series":
-            try:
-                return "series", parts[2], int(parts[3]), int(parts[4])
-            except ValueError:
-                return None
-        if len(parts) == 3 and parts[1] == "series":
-            return "series", parts[2], 1, 1
-    return None
-
-
-def player_grant(token: str) -> Optional[str]:
-    key = f"grant:{token}"
-    hit = cache_get(key)
-    if hit is not None:
-        return hit
-    st, data = http_get(f"{KODDO}/api/player-gate/status?t={quote(token, safe='')}")
-    if st == 200 and isinstance(data, dict) and data.get("ok") and data.get("grant"):
-        return cache_set(key, data["grant"])
-    return None
-
-
-def fetch_sources(grant: str) -> List[dict]:
-    key = f"src:{grant}"
-    hit = cache_get(key)
-    if hit is not None:
-        return hit
-    url = f"{CDN}/c/v2/{grant}/master.m3u8?cv=14"
-    st, data = http_get(url, accept="application/json")
-    sources = []
-    if st == 200 and isinstance(data, dict):
-        sources = data.get("sources") or []
-    return cache_set(key, sources)
-
-
-def filter_1080(sources: List[dict]) -> List[dict]:
-    out = []
-    for s in sources:
-        if not isinstance(s, dict):
-            continue
-        url = s.get("url") or ""
-        if not url:
-            continue
-        max_q = int(s.get("maxQuality") or 0)
-        height = 0
-        q = s.get("quality")
-        if isinstance(q, dict):
-            height = int(q.get("height") or 0)
-        quals = s.get("qualities") or []
-        if isinstance(quals, list) and quals:
-            try:
-                height = max(height, max(int(x) for x in quals if isinstance(x, int) or str(x).isdigit()))
-            except Exception:
-                pass
-        best = max(max_q, height)
-        if best and best < MIN_HEIGHT:
-            continue
-        out.append(s)
-    return out
-
-
-def streams_for_token(token: str, label_base: str) -> List[dict]:
-    grant = player_grant(token)
-    if not grant:
-        return []
-    sources = filter_1080(fetch_sources(grant))
-    streams = []
-    for s in sources:
-        url = s.get("url")
-        if not url:
-            continue
-        height = 0
-        q = s.get("quality")
-        if isinstance(q, dict):
-            height = int(q.get("height") or 0)
-        max_q = int(s.get("maxQuality") or height or 1080)
-        qlabel = f"{max_q}p" if max_q else "1080p"
-        langs = s.get("languages") or []
-        lang = ",".join(langs) if langs else ""
-        name = s.get("label") or s.get("id") or "Koddo"
-        title_lines = [label_base, f"{name} · {qlabel}"]
-        if lang:
-            title_lines.append(lang)
-        streams.append(
-            {
-                "name": f"Koddo · {qlabel}",
-                "title": "\n".join(title_lines),
-                "url": url,
-                "behaviorHints": {
-                    "notWebReady": False,
-                    "bingeGroup": f"koddo-{token}",
-                    "proxyHeaders": {
-                        "request": {
-                            "Referer": f"{KODDO}/",
-                            "Origin": KODDO,
-                            "User-Agent": UA,
-                        }
-                    },
-                },
-            }
-        )
     return streams
-
-
-def cinemeta_name(stype: str, imdb: str) -> str:
-    st, data = http_get(f"https://v3-cinemeta.strem.io/meta/{stype}/{imdb}.json")
-    if st == 200 and isinstance(data, dict):
-        meta = data.get("meta") or {}
-        return meta.get("name") or meta.get("originalName") or ""
-    return ""
-
-
-def find_koddo_by_name(name: str, stype: str, year: Optional[int] = None) -> Optional[str]:
-    results = search_koddo(name)
-    kind = "series" if stype == "series" else "movie"
-    exact = []
-    soft = []
-    nl = name.lower().strip()
-    for r in results:
-        if (r.get("kind") or "") != kind:
-            continue
-        rn = (r.get("name") or "").lower().strip()
-        if rn == nl:
-            exact.append(r)
-        elif nl in rn or rn in nl:
-            soft.append(r)
-    pool = exact or soft
-    if year and pool:
-        for r in pool:
-            if str(r.get("year")) == str(year):
-                return r.get("id")
-    return pool[0].get("id") if pool else None
 
 
 @app.route("/")
 @app.route("/manifest.json")
 def manifest():
-    return jsonify(
-        {
-            "id": APP_ID,
-            "version": VERSION,
-            "name": APP_NAME,
-            "description": "Koddo native 1080p+ (Solace). Set KODDO_COOKIE after Turnstile if gate blocks VPS.",
-            "logo": "https://koddo.to/android-chrome-192x192-v2.png",
-            "resources": ["catalog", "meta", "stream"],
-            "types": ["movie", "series"],
-            "idPrefixes": ["koddo:", "tt"],
-            "catalogs": [
-                {
-                    "type": "movie",
-                    "id": "koddo-movie",
-                    "name": "Koddo Movies",
-                    "extra": [{"name": "search", "isRequired": False}, {"name": "skip"}],
-                },
-                {
-                    "type": "series",
-                    "id": "koddo-series",
-                    "name": "Koddo Series",
-                    "extra": [{"name": "search", "isRequired": False}, {"name": "skip"}],
-                },
-            ],
-            "behaviorHints": {"configurable": False, "configurationRequired": False},
-        }
-    )
+    body = {
+        "id": ADDON_ID,
+        "version": VERSION,
+        "name": ADDON_NAME,
+        "description": "Fprime — movies & series (1080p+). Storage + Astra.",
+        "logo": "https://fprime.at/icon-192.png",
+        "resources": ["catalog", "meta", "stream"],
+        "types": ["movie", "series"],
+        "idPrefixes": ["tt", "tmdb"],
+        "catalogs": [
+            {
+                "type": "movie",
+                "id": "fprime-trending-movie",
+                "name": "Fprime Trending",
+                "extra": [{"name": "skip"}],
+            },
+            {
+                "type": "movie",
+                "id": "fprime-popular-movie",
+                "name": "Fprime Popular",
+                "extra": [{"name": "skip"}],
+            },
+            {
+                "type": "series",
+                "id": "fprime-trending-series",
+                "name": "Fprime Trending",
+                "extra": [{"name": "skip"}],
+            },
+            {
+                "type": "series",
+                "id": "fprime-popular-series",
+                "name": "Fprime Popular",
+                "extra": [{"name": "skip"}],
+            },
+            {
+                "type": "movie",
+                "id": "fprime-search",
+                "name": "Fprime Search",
+                "extra": [{"name": "search", "isRequired": True}],
+            },
+            {
+                "type": "series",
+                "id": "fprime-search",
+                "name": "Fprime Search",
+                "extra": [{"name": "search", "isRequired": True}],
+            },
+        ],
+        "behaviorHints": {"configurable": False, "configurationRequired": False},
+    }
+    return cors(jsonify(body))
 
 
 @app.route("/catalog/<stype>/<cid>.json")
 @app.route("/catalog/<stype>/<cid>/<path:extra>.json")
 def catalog(stype: str, cid: str, extra: str = ""):
-    search_q = ""
+    search = None
+    skip = 0
     if extra:
-        m = re.search(r"search=([^&/]+)", extra)
-        if m:
-            search_q = unquote(m.group(1))
+        for part in extra.replace(".json", "").split("&"):
+            if part.startswith("search="):
+                search = part.split("=", 1)[1]
+            if part.startswith("skip="):
+                try:
+                    skip = int(part.split("=", 1)[1])
+                except ValueError:
+                    skip = 0
+    if request.args.get("search"):
+        search = request.args.get("search")
+    if request.args.get("skip"):
+        try:
+            skip = int(request.args.get("skip"))
+        except ValueError:
+            pass
 
-    metas: List[dict] = []
-    if search_q:
-        for r in search_koddo(search_q):
-            kind = r.get("kind")
-            if stype == "movie" and kind != "movie":
-                continue
-            if stype == "series" and kind != "series":
-                continue
-            metas.append(meta_from_item(r, stype))
-    else:
-        for r in provider_items("netflix"):
-            if not isinstance(r, dict) or not r.get("id"):
-                continue
-            kind = r.get("kind") or r.get("type")
-            if stype == "movie" and kind == "series":
-                continue
-            if stype == "series" and kind == "movie":
-                continue
-            r = dict(r)
-            r["kind"] = "series" if stype == "series" else "movie"
-            metas.append(meta_from_item(r, stype))
-        if not metas:
-            q = "matrix" if stype == "movie" else "breaking"
-            for r in search_koddo(q):
-                kind = r.get("kind")
-                if stype == "movie" and kind == "movie":
-                    metas.append(meta_from_item(r))
-                if stype == "series" and kind == "series":
-                    metas.append(meta_from_item(r))
+    page = max(1, skip // 20 + 1)
 
-    return jsonify({"metas": metas[:60]})
+    def load():
+        items = []
+        if search:
+            data = get_json(
+                f"{TMDB}/search/multi?query={quote(search)}"
+                f"&language=en-US&page={page}&include_adult=false"
+            )
+            for it in (data or {}).get("results") or []:
+                mt = it.get("media_type")
+                if stype == "movie" and mt != "movie":
+                    continue
+                if stype == "series" and mt != "tv":
+                    continue
+                c = catalog_item(it)
+                if c:
+                    items.append(c)
+            return items
 
-
-@app.route("/meta/<stype>/<path:mid>.json")
-def meta(stype: str, mid: str):
-    mid = unquote(mid).replace(".json", "")
-    kid = mid
-    if mid.startswith("koddo:"):
-        parts = mid.split(":")
-        if len(parts) >= 3:
-            stype = parts[1]
-            kid = parts[2]
-    kind = "series" if stype == "series" else "movie"
-    title = get_title(kind, kid)
-    if not title:
-        return jsonify({"meta": {}})
-    m = meta_from_item(title, kind)
-    m["id"] = f"koddo:{kind}:{kid}"
-    if kind == "series":
-        m["videos"] = build_series_videos(title)
-    return jsonify({"meta": m})
-
-
-@app.route("/stream/<stype>/<path:sid>.json")
-def stream(stype: str, sid: str):
-    sid = unquote(sid).replace(".json", "")
-    streams: List[dict] = []
-
-    parsed = parse_stream_id(sid)
-    if parsed:
-        ktype, kid, season, episode = parsed
-        if ktype == "movie":
-            label = kid
-            title = get_title("movie", kid)
-            if title:
-                label = f"{title.get('name') or kid}"
-                if title.get("year"):
-                    label += f" ({title['year']})"
-            streams = streams_for_token(kid, label)
+        if "trending" in cid:
+            path = "movie" if stype == "movie" else "tv"
+            data = get_json(
+                f"{TMDB}/trending/{path}/week?language=en-US&page={page}"
+            )
         else:
-            token = f"{kid}.{season}.{episode}"
-            label = f"Tap {episode}"
-            title = get_title("series", kid)
-            if title:
-                label = f"{title.get('name') or kid} · Tap {episode}"
-            streams = streams_for_token(token, label)
-        return jsonify({"streams": streams})
+            path = "movie" if stype == "movie" else "tv"
+            data = get_json(
+                f"{TMDB}/discover/{path}?language=en-US&sort_by=popularity.desc"
+                f"&vote_count.gte=50&page={page}&include_adult=false"
+            )
+        for it in (data or {}).get("results") or []:
+            it.setdefault("media_type", "movie" if stype == "movie" else "tv")
+            c = catalog_item(it)
+            if c:
+                items.append(c)
+        return items
 
-    if sid.startswith("tt") or re.match(r"^tt\d+", sid):
-        imdb = sid.split(":")[0]
-        season = episode = 0
-        if stype == "series" and sid.count(":") >= 2:
-            parts = sid.split(":")
-            try:
-                season, episode = int(parts[1]), int(parts[2])
-            except ValueError:
-                pass
-        name = cinemeta_name(stype, imdb)
-        if name:
-            kid = find_koddo_by_name(name, stype)
-            if kid:
-                if stype == "movie":
-                    streams = streams_for_token(kid, name)
-                else:
-                    s, e = season or 1, episode or 1
-                    streams = streams_for_token(f"{kid}.{s}.{e}", f"{name} · Tap {e}")
-
-    return jsonify({"streams": streams})
+    metas = cached(f"cat:{stype}:{cid}:{search}:{page}", load, 600)
+    return cors(jsonify({"metas": metas or []}))
 
 
-@app.route("/health")
-def health():
-    return jsonify({"ok": True, "version": VERSION, "cffi": HAS_CFFI, "cookie_set": bool(COOKIE)})
+@app.route("/meta/<stype>/<path:sid>")
+def meta(stype: str, sid: str):
+    sid = sid.replace(".json", "")
+    info = parse_stream_id(sid)
+    if not info:
+        return cors(jsonify({"meta": {}}))
+
+    mtype = info["type"]
+    tid = info["tmdb"]
+
+    def load():
+        if mtype == "movie":
+            data = get_json(
+                f"{TMDB}/movie/{tid}?language=en-US&append_to_response=external_ids"
+            )
+            if not data:
+                return {}
+            return meta_from_tmdb(data, "movie")
+        data = get_json(
+            f"{TMDB}/tv/{tid}?language=en-US&append_to_response=external_ids"
+        )
+        if not data:
+            return {}
+        base = meta_from_tmdb(data, "tv")
+        videos = []
+        imdb = base.get("id") if str(base.get("id", "")).startswith("tt") else None
+        for season in data.get("seasons") or []:
+            sn = season.get("season_number") or 0
+            if sn < 1:
+                continue
+            sdata = get_json(f"{TMDB}/tv/{tid}/season/{sn}?language=en-US")
+            for ep in (sdata or {}).get("episodes") or []:
+                en = ep.get("episode_number") or 0
+                eid = (
+                    f"{imdb}:{sn}:{en}" if imdb else f"tmdb:tv:{tid}:{sn}:{en}"
+                )
+                videos.append(
+                    {
+                        "id": eid,
+                        "title": f"Tập {en}"
+                        + (f" — {ep['name']}" if ep.get("name") else ""),
+                        "season": sn,
+                        "episode": en,
+                        "released": ep.get("air_date") or "",
+                        "thumbnail": poster_url(ep.get("still_path"), "w300"),
+                    }
+                )
+        base["videos"] = videos
+        return base
+
+    meta_obj = cached(f"meta:{mtype}:{tid}", load, 1800)
+    return cors(jsonify({"meta": meta_obj or {}}))
+
+
+@app.route("/stream/<stype>/<path:sid>")
+def stream(stype: str, sid: str):
+    sid = sid.replace(".json", "")
+    info = parse_stream_id(sid)
+    if not info:
+        return cors(jsonify({"streams": []}))
+    if info["type"] == "tv" and not info.get("episode"):
+        return cors(jsonify({"streams": []}))
+
+    def load():
+        return build_streams(info)
+
+    key = (
+        f"stream:{info['type']}:{info['tmdb']}:"
+        f"{info.get('season', 0)}:{info.get('episode', 0)}"
+    )
+    streams = cached(key, load, 300)
+    return cors(jsonify({"streams": streams or []}))
+
+
+@app.route("/<path:_any>", methods=["OPTIONS"])
+@app.route("/", methods=["OPTIONS"])
+def options(_any: str = ""):
+    return cors(Response(status=204))
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT, debug=False)
+    app.run(host="0.0.0.0", port=PORT, threaded=True)
