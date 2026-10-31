@@ -15,7 +15,7 @@ from flask import Flask, Response, jsonify, request
 app = Flask(__name__)
 
 PORT = 51823
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 ADDON_NAME = "Fprime"
 ADDON_ID = "org.nuvio.fprime"
 
@@ -182,7 +182,9 @@ def catalog_item(item: dict) -> Optional[dict]:
     }
 
 
-def fetch_master_variants(url: str) -> list[dict]:
+def probe_master(url: str) -> Optional[dict]:
+    """Return {url, quality, height} for master if playable and max height >= 1080.
+    Keep MASTER url (not variant) so player requests with same proxyHeaders."""
     try:
         r = SESSION.get(
             url,
@@ -190,61 +192,32 @@ def fetch_master_variants(url: str) -> list[dict]:
             headers={"Referer": "https://fprime.at/", "User-Agent": UA},
         )
         if r.status_code != 200:
-            return [{"url": url, "quality": "AUTO", "height": 0}]
-        text = r.text
-        if "#EXT-X-STREAM-INF" not in text:
-            return [{"url": url, "quality": "AUTO", "height": 0}]
-        lines = text.splitlines()
-        variants = []
-        i = 0
-        while i < len(lines):
-            line = lines[i].strip()
-            if line.startswith("#EXT-X-STREAM-INF"):
-                height = 0
-                m = re.search(r"RESOLUTION=(\d+)x(\d+)", line)
-                if m:
-                    height = int(m.group(2))
-                bw = 0
-                mb = re.search(r"BANDWIDTH=(\d+)", line)
-                if mb:
-                    bw = int(mb.group(1))
-                if i + 1 < len(lines):
-                    stream_url = lines[i + 1].strip()
-                    if stream_url and not stream_url.startswith("#"):
-                        if stream_url.startswith("http"):
-                            full = stream_url
-                        else:
-                            base = url.rsplit("/", 1)[0]
-                            full = base + "/" + stream_url.lstrip("/")
-                        variants.append(
-                            {"url": full, "height": height, "bandwidth": bw}
-                        )
-                i += 2
-            else:
-                i += 1
-        good = [v for v in variants if v["height"] >= 1080]
-        if not good:
-            if variants:
-                variants.sort(
-                    key=lambda x: (x["height"], x["bandwidth"]), reverse=True
-                )
-                top = variants[0]
-                q = f"{top['height']}p" if top["height"] else "AUTO"
-                return [{"url": top["url"], "quality": q, "height": top["height"]}]
-            return [{"url": url, "quality": "AUTO", "height": 0}]
-        good.sort(key=lambda x: (x["height"], x["bandwidth"]), reverse=True)
-        out = []
-        for v in good:
-            if v["height"] >= 2160:
-                q = "4K"
-            elif v["height"] >= 1440:
-                q = "1440p"
-            else:
-                q = "1080p"
-            out.append({"url": v["url"], "quality": q, "height": v["height"]})
-        return out
+            return None
+        text = r.text or ""
+        # blocked / html
+        if "<html" in text[:200].lower() or not text.lstrip().startswith("#EXTM3U"):
+            return None
+        max_h = 0
+        for line in text.splitlines():
+            m = re.search(r"RESOLUTION=(\d+)x(\d+)", line)
+            if m:
+                max_h = max(max_h, int(m.group(2)))
+        # media playlist without stream-inf → treat as playable AUTO
+        if max_h == 0 and "#EXTINF" in text:
+            return {"url": url, "quality": "AUTO", "height": 0}
+        if max_h and max_h < 1080:
+            return None
+        if max_h >= 2160:
+            q = "4K"
+        elif max_h >= 1440:
+            q = "1440p"
+        elif max_h >= 1080:
+            q = "1080p"
+        else:
+            q = "AUTO"
+        return {"url": url, "quality": q, "height": max_h}
     except Exception:
-        return [{"url": url, "quality": "AUTO", "height": 0}]
+        return None
 
 
 def get_storage_url(
@@ -292,37 +265,36 @@ def build_streams(info: dict) -> list[dict]:
         sources.append(("Astra", astra))
 
     for server, raw_url in sources:
-        variants = fetch_master_variants(raw_url)
-        for v in variants:
-            if v["height"] and v["height"] < 1080:
-                continue
-            u = v["url"]
-            if u in seen:
-                continue
-            seen.add(u)
-            q = v["quality"]
-            if episode:
-                title = f"Tập {episode}\n{q} · {server}"
-            else:
-                title = f"{q} · {server}"
-            streams.append(
-                {
-                    "name": f"Fprime {q}",
-                    "title": title,
-                    "url": u,
-                    "behaviorHints": {
-                        "notWebReady": False,
-                        "bingeGroup": f"fprime-{tmdb}-{season}-{episode}-{server}",
-                        "proxyHeaders": {
-                            "request": {
-                                "Referer": "https://fprime.at/",
-                                "Origin": "https://fprime.at/",
-                                "User-Agent": UA,
-                            }
-                        },
+        v = probe_master(raw_url)
+        if not v:
+            continue
+        u = v["url"]
+        if u in seen:
+            continue
+        seen.add(u)
+        q = v["quality"]
+        if episode:
+            title = f"Tập {episode}\n{q} · {server}"
+        else:
+            title = f"{q} · {server}"
+        streams.append(
+            {
+                "name": f"Fprime {q}",
+                "title": title,
+                "url": u,
+                "behaviorHints": {
+                    "notWebReady": True,
+                    "bingeGroup": f"fprime-{tmdb}-{season}-{episode}-{server}",
+                    "proxyHeaders": {
+                        "request": {
+                            "Referer": "https://fprime.at/",
+                            "Origin": "https://fprime.at/",
+                            "User-Agent": UA,
+                        }
                     },
-                }
-            )
+                },
+            }
+        )
     return streams
 
 
