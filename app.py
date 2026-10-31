@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Fprime Stremio/Nuvio addon — catalog + streams (Storage + Astra AES-GCM)."""
+"""Fprime Stremio/Nuvio addon — Storage + Astra (AES-GCM). Direct CDN, no VPS proxy."""
 
 from __future__ import annotations
 
 import re
 import time
 from typing import Any, Optional
-from urllib.parse import quote
 
 import requests
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -15,7 +14,7 @@ from flask import Flask, Response, jsonify, request
 app = Flask(__name__)
 
 PORT = 51823
-VERSION = "1.0.1"
+VERSION = "1.0.4"
 ADDON_NAME = "Fprime"
 ADDON_ID = "org.nuvio.fprime"
 
@@ -27,10 +26,20 @@ ASTRA_KEY = bytes.fromhex(
 )
 IMG = "https://image.tmdb.org/t/p"
 
+# Headers khớp Lemur (browser thật)
 UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/127.0.0.0 Mobile Safari/537.36"
 )
+REQ_HEADERS = {
+    "User-Agent": UA,
+    "Referer": "https://fprime.at/",
+    "Origin": "https://fprime.at",
+    "Accept": "*/*",
+    "Accept-Language": "vi-VN",
+    "Accept-Encoding": "identity",
+}
+
 SESSION = requests.Session()
 SESSION.headers.update(
     {
@@ -49,23 +58,25 @@ def cors(resp: Response) -> Response:
     resp.headers["Access-Control-Allow-Origin"] = "*"
     resp.headers["Access-Control-Allow-Headers"] = "*"
     resp.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
-    resp.headers["Content-Type"] = "application/json; charset=utf-8"
+    if "Content-Type" not in resp.headers:
+        resp.headers["Content-Type"] = "application/json; charset=utf-8"
     return resp
 
 
-def cached(key: str, fn, ttl: int = CACHE_TTL):
+def cached(key: str, fn):
     now = time.time()
-    hit = CACHE.get(key)
-    if hit and now - hit[0] < ttl:
-        return hit[1]
+    if key in CACHE:
+        ts, val = CACHE[key]
+        if now - ts < CACHE_TTL:
+            return val
     val = fn()
     CACHE[key] = (now, val)
     return val
 
 
-def get_json(url: str, timeout: int = 15) -> Optional[dict]:
+def get_json(url: str) -> Optional[dict]:
     try:
-        r = SESSION.get(url, timeout=timeout)
+        r = SESSION.get(url, timeout=12)
         if r.status_code == 200:
             return r.json()
     except Exception:
@@ -78,151 +89,152 @@ def decrypt_astra(enc: str) -> Optional[str]:
         if enc.startswith("as_"):
             enc = enc[3:]
         raw = bytes.fromhex(enc)
-        if len(raw) < 28:
-            return None
-        iv, ct = raw[:12], raw[12:]
-        plain = AESGCM(ASTRA_KEY).decrypt(iv, ct, None)
-        return plain.decode("utf-8", errors="ignore")
+        return AESGCM(ASTRA_KEY).decrypt(raw[:12], raw[12:], None).decode()
     except Exception:
         return None
 
 
-def imdb_to_tmdb(imdb_id: str) -> Optional[tuple[str, int]]:
-    def _fetch():
-        data = get_json(
-            f"{TMDB}/find/{imdb_id}?external_source=imdb_id&language=en-US"
-        )
+def tmdb_find_imdb(imdb: str) -> Optional[dict]:
+    def _():
+        data = get_json(f"{TMDB}/find/{imdb}?external_source=imdb_id")
         if not data:
             return None
-        for key, mtype in (("movie_results", "movie"), ("tv_results", "tv")):
+        for key in ("movie_results", "tv_results"):
             arr = data.get(key) or []
             if arr:
-                return mtype, int(arr[0]["id"])
+                item = arr[0]
+                item["_media"] = "movie" if key == "movie_results" else "tv"
+                return item
         return None
 
-    return cached(f"imdb:{imdb_id}", _fetch, 3600)
+    return cached(f"find:{imdb}", _)
 
 
-def parse_stream_id(sid: str) -> Optional[dict]:
-    sid = sid.replace(".json", "").strip()
-    if sid.startswith("tmdb:"):
-        parts = sid.split(":")
-        if len(parts) == 3 and parts[1] in ("movie", "tv"):
-            return {"type": parts[1], "tmdb": int(parts[2])}
-        if len(parts) == 5 and parts[1] == "tv":
-            return {
-                "type": "tv",
-                "tmdb": int(parts[2]),
-                "season": int(parts[3]),
-                "episode": int(parts[4]),
-            }
-        return None
+def parse_id(id_str: str) -> Optional[dict]:
+    id_str = id_str.replace(".json", "")
 
-    m = re.match(r"^(tt\d+)(?::(\d+):(\d+))?$", sid)
-    if not m:
-        return None
-    imdb = m.group(1)
-    mapped = imdb_to_tmdb(imdb)
-    if not mapped:
-        return None
-    mtype, tid = mapped
-    out = {"type": mtype, "tmdb": tid, "imdb": imdb}
-    if m.group(2) and m.group(3):
-        out["season"] = int(m.group(2))
-        out["episode"] = int(m.group(3))
-        out["type"] = "tv"
-    return out
+    # tmdb:123:1:2
+    m = re.match(r"^tmdb[:\-]?(\d+):(\d+):(\d+)$", id_str)
+    if m:
+        return {
+            "type": "tv",
+            "tmdb": int(m.group(1)),
+            "season": int(m.group(2)),
+            "episode": int(m.group(3)),
+        }
+
+    # tt1234567:1:2
+    m = re.match(r"^(tt\d+):(\d+):(\d+)$", id_str)
+    if m:
+        imdb, season, episode = m.group(1), int(m.group(2)), int(m.group(3))
+        found = tmdb_find_imdb(imdb)
+        if not found:
+            return None
+        return {
+            "type": "tv",
+            "tmdb": found["id"],
+            "season": season,
+            "episode": episode,
+            "name": found.get("name") or found.get("title"),
+        }
+
+    if id_str.startswith("tt"):
+        found = tmdb_find_imdb(id_str)
+        if not found:
+            return None
+        return {
+            "type": "movie" if found.get("_media") == "movie" else "tv",
+            "tmdb": found["id"],
+            "name": found.get("title") or found.get("name"),
+        }
+
+    m = re.match(r"^tmdb[:\-]?(\d+)$", id_str)
+    if m:
+        return {"type": "movie", "tmdb": int(m.group(1))}
+    return None
 
 
 def poster_url(path: Optional[str], size: str = "w500") -> Optional[str]:
     if not path:
         return None
+    if path.startswith("http"):
+        return path
     return f"{IMG}/{size}{path}"
 
 
-def meta_from_tmdb(item: dict, media_type: str) -> dict:
-    tid = item.get("id")
-    title = item.get("title") or item.get("name") or "Unknown"
-    year = (item.get("release_date") or item.get("first_air_date") or "")[:4]
-    ext = item.get("external_ids") or {}
-    imdb = ext.get("imdb_id")
-    mid = imdb or f"tmdb:{media_type}:{tid}"
-    meta = {
-        "id": mid,
-        "type": "movie" if media_type == "movie" else "series",
-        "name": title,
-        "poster": poster_url(item.get("poster_path")),
-        "background": poster_url(item.get("backdrop_path"), "w1280"),
-        "description": item.get("overview") or "",
-        "releaseInfo": year,
-        "imdbRating": str(round(item.get("vote_average") or 0, 1))
-        if item.get("vote_average")
-        else None,
-        "genres": [g["name"] for g in (item.get("genres") or []) if g.get("name")],
-    }
-    return {k: v for k, v in meta.items() if v is not None}
-
-
-def catalog_item(item: dict) -> Optional[dict]:
-    mtype = item.get("media_type") or ("movie" if "title" in item else "tv")
-    if mtype not in ("movie", "tv"):
-        return None
-    title = item.get("title") or item.get("name")
-    if not title:
-        return None
-    year = (item.get("release_date") or item.get("first_air_date") or "")[:4]
-    return {
-        "id": f"tmdb:{mtype}:{item['id']}",
-        "type": "movie" if mtype == "movie" else "series",
-        "name": title,
-        "poster": poster_url(item.get("poster_path")),
-        "background": poster_url(item.get("backdrop_path"), "w1280"),
-        "description": item.get("overview") or "",
-        "releaseInfo": year,
-    }
-
-
-def probe_master(url: str) -> Optional[dict]:
-    """Return {url, quality, height} for master if playable and max height >= 1080.
-    Keep MASTER url (not variant) so player requests with same proxyHeaders."""
-    try:
-        r = SESSION.get(
-            url,
-            timeout=12,
-            headers={"Referer": "https://fprime.at/", "User-Agent": UA},
-        )
-        if r.status_code != 200:
+def meta_from_tmdb(mtype: str, tmdb_id: int) -> Optional[dict]:
+    def _():
+        path = "movie" if mtype == "movie" else "tv"
+        data = get_json(f"{TMDB}/{path}/{tmdb_id}?language=en-US")
+        if not data:
             return None
-        text = r.text or ""
-        # blocked / html
-        if "<html" in text[:200].lower() or not text.lstrip().startswith("#EXTM3U"):
-            return None
-        max_h = 0
-        for line in text.splitlines():
-            m = re.search(r"RESOLUTION=(\d+)x(\d+)", line)
-            if m:
-                max_h = max(max_h, int(m.group(2)))
-        # media playlist without stream-inf → treat as playable AUTO
-        if max_h == 0 and "#EXTINF" in text:
-            return {"url": url, "quality": "AUTO", "height": 0}
-        if max_h and max_h < 1080:
-            return None
-        if max_h >= 2160:
-            q = "4K"
-        elif max_h >= 1440:
-            q = "1440p"
-        elif max_h >= 1080:
-            q = "1080p"
+        name = data.get("title") or data.get("name") or ""
+        year = (data.get("release_date") or data.get("first_air_date") or "")[:4]
+        genres = [g["name"] for g in (data.get("genres") or [])]
+        meta = {
+            "id": f"tmdb:{tmdb_id}",
+            "type": "movie" if mtype == "movie" else "series",
+            "name": name,
+            "poster": poster_url(data.get("poster_path")),
+            "background": poster_url(data.get("backdrop_path"), "w1280"),
+            "description": data.get("overview") or "",
+            "releaseInfo": year,
+            "imdbRating": str(data.get("vote_average") or ""),
+            "genres": genres,
+        }
+        if mtype == "tv":
+            videos = []
+            for s in range(1, min((data.get("number_of_seasons") or 1), 30) + 1):
+                season = get_json(f"{TMDB}/tv/{tmdb_id}/season/{s}?language=en-US")
+                if not season:
+                    continue
+                for ep in season.get("episodes") or []:
+                    videos.append(
+                        {
+                            "id": f"tmdb:{tmdb_id}:{s}:{ep.get('episode_number')}",
+                            "title": ep.get("name") or f"Tập {ep.get('episode_number')}",
+                            "season": s,
+                            "episode": ep.get("episode_number"),
+                            "released": ep.get("air_date") or "",
+                            "thumbnail": poster_url(ep.get("still_path"), "w300"),
+                        }
+                    )
+            meta["videos"] = videos
+        return meta
+
+    return cached(f"meta:{mtype}:{tmdb_id}", _)
+
+
+def catalog_items(kind: str, mtype: str, skip: int = 0) -> list:
+    def _():
+        path = "movie" if mtype == "movie" else "tv"
+        endpoint = "trending" if kind == "trending" else "popular"
+        if endpoint == "trending":
+            url = f"{TMDB}/trending/{path}/week?language=en-US"
         else:
-            q = "AUTO"
-        return {"url": url, "quality": q, "height": max_h}
-    except Exception:
-        return None
+            url = f"{TMDB}/{path}/popular?language=en-US&page=1"
+        data = get_json(url)
+        if not data:
+            return []
+        out = []
+        for item in (data.get("results") or [])[skip : skip + 30]:
+            tid = item.get("id")
+            name = item.get("title") or item.get("name") or ""
+            out.append(
+                {
+                    "id": f"tmdb:{tid}",
+                    "type": "movie" if mtype == "movie" else "series",
+                    "name": name,
+                    "poster": poster_url(item.get("poster_path")),
+                    "releaseInfo": (item.get("release_date") or item.get("first_air_date") or "")[:4],
+                }
+            )
+        return out
+
+    return cached(f"cat:{kind}:{mtype}:{skip}", _) or []
 
 
-def get_storage_url(
-    mtype: str, tmdb: int, season: int = 0, episode: int = 0
-) -> Optional[str]:
+def get_storage_url(mtype: str, tmdb: int, season: int = 0, episode: int = 0) -> Optional[str]:
     if mtype == "movie":
         data = get_json(f"{STORAGE}/movie/{tmdb}")
     else:
@@ -232,9 +244,7 @@ def get_storage_url(
     return None
 
 
-def get_astra_url(
-    mtype: str, tmdb: int, season: int = 0, episode: int = 0
-) -> Optional[str]:
+def get_astra_url(mtype: str, tmdb: int, season: int = 0, episode: int = 0) -> Optional[str]:
     if mtype == "movie":
         url = f"{ASTRA}?tmdbId={tmdb}&type=movie"
     else:
@@ -248,6 +258,36 @@ def get_astra_url(
     return decrypt_astra(enc)
 
 
+def max_height_of_master(url: str) -> int:
+    """Optional quality probe — does not replace returned URL."""
+    try:
+        r = SESSION.get(url, timeout=10, headers=REQ_HEADERS)
+        if r.status_code != 200 or not (r.text or "").lstrip().startswith("#EXTM3U"):
+            return 0
+        h = 0
+        for line in r.text.splitlines():
+            m = re.search(r"RESOLUTION=\d+x(\d+)", line)
+            if m:
+                h = max(h, int(m.group(1)))
+        return h
+    except Exception:
+        return 0
+
+
+def quality_label(height: int) -> str:
+    if height >= 2160:
+        return "4K"
+    if height >= 1440:
+        return "1440p"
+    if height >= 1080:
+        return "1080p"
+    if height >= 720:
+        return "720p"
+    if height > 0:
+        return f"{height}p"
+    return "AUTO"
+
+
 def build_streams(info: dict) -> list[dict]:
     mtype = info["type"]
     tmdb = info["tmdb"]
@@ -256,23 +296,23 @@ def build_streams(info: dict) -> list[dict]:
     streams: list[dict] = []
     seen = set()
 
-    sources = []
+    pairs = []
     storage = get_storage_url(mtype, tmdb, season, episode)
     if storage:
-        sources.append(("Storage", storage))
+        pairs.append(("Storage", storage))
     astra = get_astra_url(mtype, tmdb, season, episode)
     if astra:
-        sources.append(("Astra", astra))
+        pairs.append(("Astra", astra))
 
-    for server, raw_url in sources:
-        v = probe_master(raw_url)
-        if not v:
+    for server, url in pairs:
+        if not url or url in seen:
             continue
-        u = v["url"]
-        if u in seen:
+        seen.add(url)
+        h = max_height_of_master(url)
+        # Chỉ hiện nếu probe được >=1080 hoặc probe fail (vẫn trả, để tránh false-empty)
+        if h and h < 1080:
             continue
-        seen.add(u)
-        q = v["quality"]
+        q = quality_label(h) if h else "1080p"
         if episode:
             title = f"Tập {episode}\n{q} · {server}"
         else:
@@ -281,17 +321,11 @@ def build_streams(info: dict) -> list[dict]:
             {
                 "name": f"Fprime {q}",
                 "title": title,
-                "url": u,
+                "url": url,
                 "behaviorHints": {
                     "notWebReady": True,
                     "bingeGroup": f"fprime-{tmdb}-{season}-{episode}-{server}",
-                    "proxyHeaders": {
-                        "request": {
-                            "Referer": "https://fprime.at/",
-                            "Origin": "https://fprime.at/",
-                            "User-Agent": UA,
-                        }
-                    },
+                    "proxyHeaders": {"request": dict(REQ_HEADERS)},
                 },
             }
         )
@@ -337,164 +371,121 @@ def manifest():
             },
             {
                 "type": "movie",
-                "id": "fprime-search",
+                "id": "fprime-search-movie",
                 "name": "Fprime Search",
                 "extra": [{"name": "search", "isRequired": True}],
             },
             {
                 "type": "series",
-                "id": "fprime-search",
+                "id": "fprime-search-series",
                 "name": "Fprime Search",
                 "extra": [{"name": "search", "isRequired": True}],
             },
         ],
-        "behaviorHints": {"configurable": False, "configurationRequired": False},
+        "behaviorHints": {"configurable": False},
     }
-    return cors(jsonify(body))
+    return cors(Response(jsonify(body).get_data(), mimetype="application/json"))
 
 
-@app.route("/catalog/<stype>/<cid>.json")
-@app.route("/catalog/<stype>/<cid>/<path:extra>.json")
-def catalog(stype: str, cid: str, extra: str = ""):
-    search = None
+@app.route("/catalog/<type_>/<id_>.json")
+def catalog(type_, id_):
     skip = 0
-    if extra:
-        for part in extra.replace(".json", "").split("&"):
-            if part.startswith("search="):
-                search = part.split("=", 1)[1]
-            if part.startswith("skip="):
-                try:
-                    skip = int(part.split("=", 1)[1])
-                except ValueError:
-                    skip = 0
-    if request.args.get("search"):
-        search = request.args.get("search")
-    if request.args.get("skip"):
+    search = None
+    extra = request.args.get("search") or ""
+    # path style extra
+    if "search=" in id_:
+        # rare
+        pass
+    q = request.args.get("search")
+    skip_s = request.args.get("skip")
+    if skip_s:
         try:
-            skip = int(request.args.get("skip"))
-        except ValueError:
-            pass
+            skip = int(skip_s)
+        except Exception:
+            skip = 0
 
-    page = max(1, skip // 20 + 1)
-
-    def load():
-        items = []
-        if search:
+    mtype = "movie" if type_ == "movie" else "tv"
+    if "search" in id_ or q:
+        keyword = q or ""
+        def _search():
+            path = "movie" if mtype == "movie" else "tv"
             data = get_json(
-                f"{TMDB}/search/multi?query={quote(search)}"
-                f"&language=en-US&page={page}&include_adult=false"
+                f"{TMDB}/search/{path}?query={requests.utils.quote(keyword)}&language=en-US"
             )
-            for it in (data or {}).get("results") or []:
-                mt = it.get("media_type")
-                if stype == "movie" and mt != "movie":
-                    continue
-                if stype == "series" and mt != "tv":
-                    continue
-                c = catalog_item(it)
-                if c:
-                    items.append(c)
-            return items
-
-        if "trending" in cid:
-            path = "movie" if stype == "movie" else "tv"
-            data = get_json(
-                f"{TMDB}/trending/{path}/week?language=en-US&page={page}"
-            )
-        else:
-            path = "movie" if stype == "movie" else "tv"
-            data = get_json(
-                f"{TMDB}/discover/{path}?language=en-US&sort_by=popularity.desc"
-                f"&vote_count.gte=50&page={page}&include_adult=false"
-            )
-        for it in (data or {}).get("results") or []:
-            it.setdefault("media_type", "movie" if stype == "movie" else "tv")
-            c = catalog_item(it)
-            if c:
-                items.append(c)
-        return items
-
-    metas = cached(f"cat:{stype}:{cid}:{search}:{page}", load, 600)
-    return cors(jsonify({"metas": metas or []}))
-
-
-@app.route("/meta/<stype>/<path:sid>")
-def meta(stype: str, sid: str):
-    sid = sid.replace(".json", "")
-    info = parse_stream_id(sid)
-    if not info:
-        return cors(jsonify({"meta": {}}))
-
-    mtype = info["type"]
-    tid = info["tmdb"]
-
-    def load():
-        if mtype == "movie":
-            data = get_json(
-                f"{TMDB}/movie/{tid}?language=en-US&append_to_response=external_ids"
-            )
-            if not data:
-                return {}
-            return meta_from_tmdb(data, "movie")
-        data = get_json(
-            f"{TMDB}/tv/{tid}?language=en-US&append_to_response=external_ids"
-        )
-        if not data:
-            return {}
-        base = meta_from_tmdb(data, "tv")
-        videos = []
-        imdb = base.get("id") if str(base.get("id", "")).startswith("tt") else None
-        for season in data.get("seasons") or []:
-            sn = season.get("season_number") or 0
-            if sn < 1:
-                continue
-            sdata = get_json(f"{TMDB}/tv/{tid}/season/{sn}?language=en-US")
-            for ep in (sdata or {}).get("episodes") or []:
-                en = ep.get("episode_number") or 0
-                eid = (
-                    f"{imdb}:{sn}:{en}" if imdb else f"tmdb:tv:{tid}:{sn}:{en}"
-                )
-                videos.append(
+            out = []
+            for item in (data or {}).get("results") or []:
+                tid = item.get("id")
+                out.append(
                     {
-                        "id": eid,
-                        "title": f"Tập {en}"
-                        + (f" — {ep['name']}" if ep.get("name") else ""),
-                        "season": sn,
-                        "episode": en,
-                        "released": ep.get("air_date") or "",
-                        "thumbnail": poster_url(ep.get("still_path"), "w300"),
+                        "id": f"tmdb:{tid}",
+                        "type": "movie" if mtype == "movie" else "series",
+                        "name": item.get("title") or item.get("name") or "",
+                        "poster": poster_url(item.get("poster_path")),
+                        "releaseInfo": (
+                            item.get("release_date") or item.get("first_air_date") or ""
+                        )[:4],
                     }
                 )
-        base["videos"] = videos
-        return base
+            return out
 
-    meta_obj = cached(f"meta:{mtype}:{tid}", load, 1800)
-    return cors(jsonify({"meta": meta_obj or {}}))
+        metas = cached(f"search:{mtype}:{keyword}", _search) if keyword else []
+        return cors(Response(jsonify({"metas": metas or []}).get_data(), mimetype="application/json"))
+
+    kind = "trending" if "trending" in id_ else "popular"
+    metas = catalog_items(kind, mtype, skip)
+    return cors(Response(jsonify({"metas": metas}).get_data(), mimetype="application/json"))
 
 
-@app.route("/stream/<stype>/<path:sid>")
-def stream(stype: str, sid: str):
-    sid = sid.replace(".json", "")
-    info = parse_stream_id(sid)
+@app.route("/meta/<type_>/<path:id_>")
+def meta(type_, id_):
+    id_ = id_.replace(".json", "")
+    info = parse_id(id_)
     if not info:
-        return cors(jsonify({"streams": []}))
-    if info["type"] == "tv" and not info.get("episode"):
-        return cors(jsonify({"streams": []}))
+        # tmdb:123 series
+        m = re.match(r"^tmdb[:\-]?(\d+)$", id_)
+        if m:
+            mtype = "movie" if type_ == "movie" else "tv"
+            meta_obj = meta_from_tmdb(mtype, int(m.group(1)))
+            return cors(
+                Response(jsonify({"meta": meta_obj or {}}).get_data(), mimetype="application/json")
+            )
+        return cors(Response(jsonify({"meta": {}}).get_data(), mimetype="application/json"))
 
-    def load():
-        return build_streams(info)
-
-    key = (
-        f"stream:{info['type']}:{info['tmdb']}:"
-        f"{info.get('season', 0)}:{info.get('episode', 0)}"
-    )
-    streams = cached(key, load, 300)
-    return cors(jsonify({"streams": streams or []}))
+    mtype = "movie" if info["type"] == "movie" else "tv"
+    meta_obj = meta_from_tmdb(mtype, info["tmdb"])
+    if meta_obj and info.get("type") == "movie":
+        meta_obj["id"] = id_ if id_.startswith("tt") else meta_obj["id"]
+    return cors(Response(jsonify({"meta": meta_obj or {}}).get_data(), mimetype="application/json"))
 
 
-@app.route("/<path:_any>", methods=["OPTIONS"])
-@app.route("/", methods=["OPTIONS"])
-def options(_any: str = ""):
-    return cors(Response(status=204))
+@app.route("/stream/<type_>/<path:id_>")
+def stream(type_, id_):
+    id_ = id_.replace(".json", "")
+    info = parse_id(id_)
+    if not info:
+        m = re.match(r"^tmdb[:\-]?(\d+)(?::(\d+):(\d+))?$", id_)
+        if m:
+            info = {
+                "type": "movie" if type_ == "movie" else "tv",
+                "tmdb": int(m.group(1)),
+                "season": int(m.group(2) or 0),
+                "episode": int(m.group(3) or 0),
+            }
+            if type_ == "series" or type_ == "tv":
+                info["type"] = "tv"
+        else:
+            return cors(Response(jsonify({"streams": []}).get_data(), mimetype="application/json"))
+
+    if type_ in ("series", "tv"):
+        info["type"] = "tv"
+
+    streams = build_streams(info)
+    return cors(Response(jsonify({"streams": streams}).get_data(), mimetype="application/json"))
+
+
+@app.route("/health")
+def health():
+    return cors(Response(jsonify({"ok": True, "version": VERSION}).get_data(), mimetype="application/json"))
 
 
 if __name__ == "__main__":
