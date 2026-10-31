@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import os
+
 import re
 import time
 import base64
@@ -16,7 +18,7 @@ from flask import Flask, Response, jsonify, request
 app = Flask(__name__)
 
 PORT = 51823
-VERSION = "1.0.6"
+VERSION = "1.0.7"
 ADDON_NAME = "Fprime"
 ADDON_ID = "org.nuvio.fprime"
 
@@ -75,7 +77,16 @@ def b64d(s: str) -> str:
 
 
 def public_base() -> str:
-    return request.host_url.rstrip("/")
+    # Bắt buộc IP public — 127.0.0.1 chỉ máy VPS thấy, điện thoại không vào được
+    env = (os.environ.get("PUBLIC_BASE") or "").rstrip("/")
+    if env:
+        return env
+    host = (request.host or "").split("%")[0]
+    if host.startswith(("127.", "0.0.0.0", "localhost", "172.", "10.")):
+        # Fallback IP Oracle VPS sếp (đổi nếu IP đổi)
+        return "http://168.138.176.147:51823"
+    scheme = request.headers.get("X-Forwarded-Proto") or request.scheme or "http"
+    return f"{scheme}://{host}".rstrip("/")
 
 
 def make_proxy_url(target: str) -> str:
