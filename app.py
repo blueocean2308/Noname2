@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import re
 import time
+import base64
 from typing import Any, Optional
+from urllib.parse import urljoin
 
 import requests
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -14,7 +16,7 @@ from flask import Flask, Response, jsonify, request
 app = Flask(__name__)
 
 PORT = 51823
-VERSION = "1.0.4"
+VERSION = "1.0.5"
 ADDON_NAME = "Fprime"
 ADDON_ID = "org.nuvio.fprime"
 
@@ -37,7 +39,6 @@ REQ_HEADERS = {
     "Origin": "https://fprime.at",
     "Accept": "*/*",
     "Accept-Language": "vi-VN",
-    "Accept-Encoding": "identity",
 }
 
 SESSION = requests.Session()
@@ -62,6 +63,23 @@ def cors(resp: Response) -> Response:
         resp.headers["Content-Type"] = "application/json; charset=utf-8"
     return resp
 
+
+
+def b64e(s: str) -> str:
+    return base64.urlsafe_b64encode(s.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def b64d(s: str) -> str:
+    pad = "=" * (-len(s) % 4)
+    return base64.urlsafe_b64decode(s + pad).decode("utf-8")
+
+
+def public_base() -> str:
+    return request.host_url.rstrip("/")
+
+
+def make_proxy_url(target: str) -> str:
+    return f"{public_base()}/p?u={b64e(target)}"
 
 def cached(key: str, fn):
     now = time.time()
@@ -317,19 +335,83 @@ def build_streams(info: dict) -> list[dict]:
             title = f"Tập {episode}\n{q} · {server}"
         else:
             title = f"{q} · {server}"
+        # 1) Via VPS — bắt buộc với segment .png (Stremio/Nuvio proxyHeaders hay fail)
         streams.append(
             {
                 "name": f"Fprime {q}",
-                "title": title,
+                "title": f"{title}\nVia VPS",
+                "url": make_proxy_url(url),
+                "behaviorHints": {
+                    "notWebReady": False,
+                    "bingeGroup": f"fprime-{tmdb}-{season}-{episode}-{server}-p",
+                },
+            }
+        )
+        # 2) Direct — thử proxyHeaders native
+        streams.append(
+            {
+                "name": f"Fprime {q} Direct",
+                "title": f"{title}\nDirect",
                 "url": url,
                 "behaviorHints": {
                     "notWebReady": True,
-                    "bingeGroup": f"fprime-{tmdb}-{season}-{episode}-{server}",
+                    "bingeGroup": f"fprime-{tmdb}-{season}-{episode}-{server}-d",
                     "proxyHeaders": {"request": dict(REQ_HEADERS)},
                 },
             }
         )
     return streams
+
+
+
+@app.route("/p")
+def hls_proxy():
+    """Proxy HLS; rewrite playlists; force video/mp2t for fake .png TS segments."""
+    token = request.args.get("u") or ""
+    try:
+        target = b64d(token)
+    except Exception:
+        return Response("bad token", status=400)
+    if not target.startswith("http"):
+        return Response("bad url", status=400)
+    try:
+        upstream = SESSION.get(target, timeout=30, headers=REQ_HEADERS)
+    except Exception as e:
+        return Response(f"upstream error: {e}", status=502)
+
+    raw = upstream.content or b""
+    ctype = (upstream.headers.get("Content-Type") or "").lower()
+
+    if raw[:7] == b"#EXTM3U" or "mpegurl" in ctype or "m3u8" in target:
+        text = raw.decode("utf-8", errors="ignore")
+        out = []
+        for line in text.splitlines():
+            s = line.strip()
+            if s and not s.startswith("#"):
+                if not s.startswith("http"):
+                    s = urljoin(target, s)
+                out.append(make_proxy_url(s))
+            else:
+                out.append(line)
+        resp = Response("\n".join(out) + "\n", status=200)
+        resp.headers["Content-Type"] = "application/vnd.apple.mpegurl"
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
+
+    # Fake PNG / JPG segments = MPEG-TS
+    if raw[:1] == b"G" or (len(raw) > 0 and raw[0] == 0x47):
+        out_ctype = "video/mp2t"
+    elif raw[:3] == b"\x1f\x8b\x08":
+        return Response("blocked upstream", status=403)
+    else:
+        out_ctype = upstream.headers.get("Content-Type") or "application/octet-stream"
+
+    resp = Response(raw, status=upstream.status_code)
+    resp.headers["Content-Type"] = out_ctype
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Accept-Ranges"] = "bytes"
+    return resp
 
 
 @app.route("/")
